@@ -7,12 +7,42 @@ import os
 import pandas as pd
 import pathlib
 import scipy.stats
+import skimage.filters
 import sklearn.mixture
 import skimage.measure
+import skimage.morphology
+import skimage.transform
 import sys
 import threadpoolctl
 import tqdm
 import tifffile
+
+
+def imread(path):
+    tiff = tifffile.TiffFile(path)
+    img = tiff.series[0].asarray()
+    channel = tiff.metaseries_metadata["PlaneInfo"]["_IllumSetting_"]
+    if not channel.endswith("-PS"):
+        raise ValueError(f"Unexpected IllumSetting naming pattern: {channel}")
+    channel = channel[:-3]
+    if tiff.series[0].shape != (2048, 2048):
+        raise ValueError(f"Unexpected image dimensions: {tiff.series[0].shape}")
+    # Apply scale and shift (channel-dependent) to account for chromatic aberration. This is not
+    # a great correction model but it seems good enough for our needs.
+    if channel == "DAPI":
+        pass
+    elif channel == "FITC":
+        pass
+    elif channel == "TRITC":
+        img = skimage.transform.rescale(img, 1.001, preserve_range=True)[2:2050, 2:2050]
+    elif channel == "CY5":
+        img = skimage.transform.rescale(img, 1.002, preserve_range=True)[1:2049, 2:2050]
+    else:
+        raise ValueError(f"Unexpected channel name: {channel}")
+    img = img.astype(np.uint16, copy=False)
+    # Crop the top and right to avoid illumination artifacts.
+    img = img[400:, :-400]
+    return img
 
 
 def gmm_fit(img):
@@ -54,7 +84,6 @@ def auto_threshold(img):
     lmax = mean2 + 3 * std2
     lmin = x[np.argmin(np.abs(y1 - y2))]
     if lmin >= mean2:
-        print("WARNING: auto_threshold: gmm failed", file=sys.stderr)
         lmin = mean2 - 3 * std2
     vmin = max(np.exp(lmin), img.min(), 0)
     vmax = min(np.exp(lmax), img.max())
@@ -80,7 +109,14 @@ def parse_paths(directory, well):
 
 
 def subtract_bg(img, block_size):
-    return np.clip(img - skimage.filters.threshold_local(img, block_size), 0, np.inf)
+    return np.clip(img - skimage.filters.threshold_local(img, block_size), 0, np.inf).astype(np.uint16)
+
+
+def calc_quality(img_dna):
+    # quality = 5 seems to be a good cutoff based on visual inspection.
+    img_filtered = skimage.filters.laplace(skimage.filters.gaussian(img_dna, 10))
+    quality = np.sum(np.abs(img_filtered))
+    return quality
 
 
 def prepare_dna(img):
@@ -93,27 +129,44 @@ def prepare_dna(img):
 
 
 def prepare_marker(img):
+    vmin, vmax = auto_threshold(img)
+    mask = img > vmin
+    mask = skimage.morphology.remove_small_objects(mask, 10)
+    img = np.where(mask, img, 0)
     img = subtract_bg(img, 51)
     return img
 
 
 def calc_parental_v5_level(args):
-    plate, well, column, directory = args
+    plate, well, column, experiment, directory = args
     df = parse_paths(directory, well)
-    df = df[df['Channel'] == 2]
+    df = df[df['Channel'].isin([1, 2])]
+    paths = (
+        df
+        .pivot(index="Site", columns="Channel", values="Path")
+        .rename(columns=lambda c: f"Channel{c}")
+        .rename_axis(columns=None)
+        .reset_index()
+    )
     results = []
-    for t in df.itertuples():
-        # FIXME: maybe go back to mean+3*std
-        img = tifffile.imread(t.Path)
-        (_, (dist, _)) = gmm_fit(img)
-        mean = np.exp(dist.stats('m'))
-        quality = np.sum(np.abs(skimage.filters.laplace(skimage.filters.gaussian(img, 10))))
+    for pt in paths.itertuples():
+        img_dna = imread(pt.Channel1)
+        img_v5 = imread(pt.Channel2)
+        vmin_dna, vmax_dna = auto_threshold(img_dna)
+        mask_dna = img_dna > vmin_dna
+        mask_dna = skimage.morphology.remove_small_objects(mask_dna, 1000)
+        log_v5 = np.log(img_v5[mask_dna])
+        v5_mean = np.mean(log_v5)
+        v5_std = np.std(log_v5)
+        v5_level = np.exp(v5_mean + v5_std * 3)
+        quality = calc_quality(img_dna)
         results.append({
             'plate': plate,
             'column': column,
-            'site': t.Site,
-            'parental_v5': int(np.clip(np.round(mean), 0, 65535)),
-            'positive_pixels': np.sum(img > mean),
+            'experiment': experiment,
+            'site': pt.Site,
+            'parental_v5': v5_level,
+            'dna_positive': np.sum(mask_dna),
             'quality': quality,
         })
     return results
@@ -130,10 +183,12 @@ def process(args):
         for site, dfs in df.groupby('Site'):
             path_dna, path_v5, *path_markers = dfs.sort_values('Channel')['Path'].values
             assert (not marker2 and len(path_markers) == 1) or (marker2 and len(path_markers) == 2)
-            img_dna = prepare_dna(tifffile.imread(path_dna))
-            img_v5 = tifffile.imread(path_v5)
+            img_dna_raw = imread(path_dna)
+            quality = calc_quality(img_dna_raw)
+            img_dna = prepare_dna(img_dna_raw)
+            img_v5 = imread(path_v5)
             img_v5 = np.clip(img_v5.astype(float) - parental_v5, 0, 65535).astype(np.uint16)
-            img_markers = [prepare_marker(tifffile.imread(p)) for p in path_markers]
+            img_markers = [prepare_marker(imread(p)) for p in path_markers]
             ipairs = [
                 ("Hoechst33342", img_dna, path_dna),
                 (marker1, img_markers[0], path_markers[0]),
@@ -141,10 +196,17 @@ def process(args):
             if marker2:
                 ipairs.append((marker2, img_markers[1], path_markers[1]))
             for marker, img, ipath in ipairs:
-                r, pvalue = scipy.stats.pearsonr(img_v5.ravel(), img.ravel())
-                # TODO: should the threshold be 100 or 0
-                # TODO: compute m2 also
-                m1 = skimage.measure.manders_coloc_coeff(img_v5, img > 100)
+                if img.any() and img_v5.any():
+                    r, pvalue = scipy.stats.pearsonr(img_v5.ravel(), img.ravel())
+                    # TODO: should the threshold be 100 or 0
+                    # TODO: compute m2 also
+                    m1 = skimage.measure.manders_coloc_coeff(img_v5, img > 0)
+                    m2 = skimage.measure.manders_coloc_coeff(img, img_v5 > 0)
+                else:
+                    r = np.nan
+                    pvalue = np.nan
+                    m1 = np.nan
+                    m2 = np.nan
                 v5_pos_count = np.sum(img_v5 > 0)
                 results.append({
                     "Plate": plate,
@@ -154,6 +216,8 @@ def process(args):
                     "Marker": marker,
                     "R": r,
                     "M1": m1,
+                    "M2": m2,
+                    "Quality": quality,
                     "V5ControlLevel": parental_v5,
                     "V5PositiveCount": v5_pos_count,
                     "PathV5": path_v5,
@@ -161,8 +225,7 @@ def process(args):
                 })
     except Exception as e:
         print(f"ERROR: process({args}) : {e}")
-        raise e from None
-        #pass
+        pass
     return results
 
 
@@ -182,6 +245,7 @@ assert out_path.suffix == '.csv', 'Output filename must end in .csv'
 df_in = pd.read_csv(in_path)
 base_path = in_path.resolve().parent
 df_in = df_in[df_in['directory'].notna()]
+df_in['experiment'] = df_in['directory']
 df_in['directory'] = df_in['directory'].map(lambda p: base_path / p)
 # Make sure parental line is only in row 1 and row 1 contains only parental
 # line.  Except in plate 8, in which rows 7 and 8 also contain parental line.
@@ -197,15 +261,15 @@ assert (df_in['cy5'] != 'gH2AX').all()
 
 # FIXME: subset for testing, delete later
 #df_in = df_in[(df_in.plate.isin([10, 11])) | ((df_in.plate == 29) & (df_in.row.isin([1, 2])))]
-#df_in = df_in[df_in.plate == 11]
+#df_in = df_in[(df_in.plate.isin([9, 11, 17]))]
+#df_in = df_in[df_in.plate == 17]
 print(df_in.groupby(['plate', 'row']).size())
 
 is_parental = df_in['row'] == 1
 df_parental = df_in[is_parental]
 df_test = df_in[~is_parental]
 
-# FIXME: combine column pairs before doing threshold
-p_args = df_parental[['plate', 'well', 'column', 'directory']].values
+p_args = df_parental[['plate', 'well', 'column', 'experiment', 'directory']].values
 print('Computing V5 intensity levels in parental cell line controls')
 with concurrent.futures.ThreadPoolExecutor(num_workers) as pool:
     results = list(tqdm.tqdm(pool.map(calc_parental_v5_level, p_args), total=len(p_args)))
@@ -217,8 +281,8 @@ df_test = pd.merge(
     df_test,
     (
         df_control
-        [df_control.quality>25]
-        .groupby(['plate', 'column'])
+        [df_control.quality > 5]
+        .groupby('experiment')
         ['parental_v5']
         .median()
         .reset_index()
@@ -238,9 +302,9 @@ df_out.to_csv(out_path, index=False)
 
 """
 
-dfp = df_out.copy()
-dfp['ColFacet'] = 'CL=' + dfp.CellLine + ' P=' + dfp.Plate.astype(str)
-g = sns.catplot(dfp, col='ColFacet', col_wrap=15, x='Marker', hue='Marker', y='M1')
+dfm = df_out.copy()
+dfm['ColFacet'] = 'CL=' + dfm.CellLine + ' P=' + dfm.Plate.astype(str)
+g = sns.catplot(dfm, col='ColFacet', col_wrap=15, x='Marker', hue='Marker', y='M1')
 g.set_titles('{col_name}')
 g.tick_params(axis='x', rotation=90)
 g.figure.tight_layout()
