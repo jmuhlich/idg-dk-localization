@@ -1,0 +1,6 @@
+*.tif
+*.pdf
+*.csv
+*.dat
+/in
+__pycache__
