@@ -137,6 +137,18 @@ def prepare_marker(img):
     return img
 
 
+def pcc(a, b):
+    ccs = np.fft.ifft2(a * b.conj())
+    ccsmax = ccs.max()
+    aamp = np.sum(np.real(a * a.conj())) / a.size
+    bamp = np.sum(np.real(b * b.conj())) / b.size
+    tamp = aamp * bamp
+    if tamp > 0:
+       return abs(ccsmax * ccsmax.conj() / (aamp * bamp))
+    else:
+       return 0
+
+
 def calc_parental_v5_level(args):
     plate, well, column, experiment, directory = args
     df = parse_paths(directory, well)
@@ -229,75 +241,80 @@ def process(args):
     return results
 
 
-threadpoolctl.threadpool_limits(1)
+def main():
+    threadpoolctl.threadpool_limits(1)
 
-if hasattr(os, "sched_getaffinity"):
-    num_workers = len(os.sched_getaffinity(0))
-else:
-    num_workers = multiprocessing.cpu_count()
+    if hasattr(os, "sched_getaffinity"):
+        num_workers = len(os.sched_getaffinity(0))
+    else:
+        num_workers = multiprocessing.cpu_count()
 
-in_path = pathlib.Path(sys.argv[1])
-out_path = pathlib.Path(sys.argv[2])
-out_control_path = pathlib.Path(sys.argv[3])
+    in_path = pathlib.Path(sys.argv[1])
+    out_path = pathlib.Path(sys.argv[2])
+    out_control_path = pathlib.Path(sys.argv[3])
 
-assert out_path.suffix == '.csv', 'Output filename must end in .csv'
+    assert out_path.suffix == '.csv', 'Output filename must end in .csv'
 
-df_in = pd.read_csv(in_path)
-base_path = in_path.resolve().parent
-df_in = df_in[df_in['directory'].notna()]
-df_in['experiment'] = df_in['directory']
-df_in['directory'] = df_in['directory'].map(lambda p: base_path / p)
-# Make sure parental line is only in row 1 and row 1 contains only parental
-# line.  Except in plate 8, in which rows 7 and 8 also contain parental line.
-# FIXME: What do do with plate 8 rows 7,8?
-assert len(df_in[
-    ((df_in['cell_line'] == 'parental') ^ (df_in['row'] == 1))
-    & ~((df_in['plate'] == 8) & df_in['row'].isin([7, 8]))
-]) == 0, 'parental lines out of place'
+    df_in = pd.read_csv(in_path)
+    base_path = in_path.resolve().parent
+    df_in = df_in[df_in['directory'].notna()]
+    df_in['experiment'] = df_in['directory']
+    df_in['directory'] = df_in['directory'].map(lambda p: base_path / p)
+    # Make sure parental line is only in row 1 and row 1 contains only parental
+    # line.  Except in plate 8, in which rows 7 and 8 also contain parental line.
+    # FIXME: What do do with plate 8 rows 7,8?
+    assert len(df_in[
+        ((df_in['cell_line'] == 'parental') ^ (df_in['row'] == 1))
+        & ~((df_in['plate'] == 8) & df_in['row'].isin([7, 8]))
+    ]) == 0, 'parental lines out of place'
 
-# Filter out EdU/gH2AX wells -- not used for colocalization.
-df_in = df_in[df_in['tritc'] != 'EdU']
-assert (df_in['cy5'] != 'gH2AX').all()
+    # Filter out EdU/gH2AX wells -- not used for colocalization.
+    df_in = df_in[df_in['tritc'] != 'EdU']
+    assert (df_in['cy5'] != 'gH2AX').all()
 
-# FIXME: subset for testing, delete later
-#df_in = df_in[(df_in.plate.isin([10, 11])) | ((df_in.plate == 29) & (df_in.row.isin([1, 2])))]
-#df_in = df_in[(df_in.plate.isin([9, 11, 17]))]
-#df_in = df_in[df_in.plate == 17]
-print(df_in.groupby(['plate', 'row']).size())
+    # FIXME: subset for testing, delete later
+    #df_in = df_in[(df_in.plate.isin([10, 11])) | ((df_in.plate == 29) & (df_in.row.isin([1, 2])))]
+    #df_in = df_in[(df_in.plate.isin([9, 11, 17]))]
+    #df_in = df_in[df_in.plate == 17]
+    print(df_in.groupby(['plate', 'row']).size())
 
-is_parental = df_in['row'] == 1
-df_parental = df_in[is_parental]
-df_test = df_in[~is_parental]
+    is_parental = df_in['row'] == 1
+    df_parental = df_in[is_parental]
+    df_test = df_in[~is_parental]
 
-p_args = df_parental[['plate', 'well', 'column', 'experiment', 'directory']].values
-print('Computing V5 intensity levels in parental cell line controls')
-with concurrent.futures.ThreadPoolExecutor(num_workers) as pool:
-    results = list(tqdm.tqdm(pool.map(calc_parental_v5_level, p_args), total=len(p_args)))
-print()
+    p_args = df_parental[['plate', 'well', 'column', 'experiment', 'directory']].values
+    print('Computing V5 intensity levels in parental cell line controls')
+    with concurrent.futures.ThreadPoolExecutor(num_workers) as pool:
+        results = list(tqdm.tqdm(pool.map(calc_parental_v5_level, p_args), total=len(p_args)))
+    print()
 
-df_control = pd.DataFrame(itertools.chain.from_iterable(results))
-df_control.to_csv(out_control_path, index=False)
-df_test = pd.merge(
-    df_test,
-    (
-        df_control
-        [df_control.quality > 5]
-        .groupby('experiment')
-        ['parental_v5']
-        .median()
-        .reset_index()
+    df_control = pd.DataFrame(itertools.chain.from_iterable(results))
+    df_control.to_csv(out_control_path, index=False)
+    df_test = pd.merge(
+        df_test,
+        (
+            df_control
+            [df_control.quality > 5]
+            .groupby('experiment')
+            ['parental_v5']
+            .median()
+            .reset_index()
+        )
     )
-)
 
-args = df_test[['plate', 'well', 'cell_line', 'tritc', 'cy5', 'parental_v5', 'directory']].values
-print('Computing colocalization metrics')
-with concurrent.futures.ThreadPoolExecutor(num_workers) as pool:
-    results = list(tqdm.tqdm(pool.map(process, args), total=len(args)))
-print()
-rows = itertools.chain.from_iterable(results)
-df_out = pd.DataFrame(rows)
+    args = df_test[['plate', 'well', 'cell_line', 'tritc', 'cy5', 'parental_v5', 'directory']].values
+    print('Computing colocalization metrics')
+    with concurrent.futures.ThreadPoolExecutor(num_workers) as pool:
+        results = list(tqdm.tqdm(pool.map(process, args), total=len(args)))
+    print()
+    rows = itertools.chain.from_iterable(results)
+    df_out = pd.DataFrame(rows)
 
-df_out.to_csv(out_path, index=False)
+    df_out.to_csv(out_path, index=False)
+
+
+if __name__  == "__main__":
+    main()
 
 
 """
