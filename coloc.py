@@ -45,7 +45,7 @@ def imread(path):
     return img
 
 
-def gmm_fit(img):
+def gmm_fit(img, n_components):
 
     assert img.ndim == 2
 
@@ -57,10 +57,10 @@ def gmm_fit(img):
     if len(np.unique(img_log)) < 2:
         return img.min(), img.max()
 
-    gmm = sklearn.mixture.GaussianMixture(2, max_iter=1000, tol=1e-6)
+    gmm = sklearn.mixture.GaussianMixture(n_components, max_iter=1000, tol=1e-6)
     gmm.fit(img_log.reshape((-1, 1)))
     means = gmm.means_[:, 0]
-    i1, i2 = np.argsort(means)
+    i1, i2 = np.argsort(means)[-2:]
     mean1, mean2 = means[[i1, i2]]
     std1, std2 = gmm.covariances_[[i1, i2], 0, 0] ** 0.5
 
@@ -71,9 +71,9 @@ def gmm_fit(img):
     return ((d1, w1), (d2, w2))
 
 
-def auto_threshold(img):
+def auto_threshold(img, n_components=2):
 
-    ((d1, w1), (d2, w2)) = gmm_fit(img)
+    ((d1, w1), (d2, w2)) = gmm_fit(img, n_components)
     mean1, std1 = d1.stats()
     mean2, std2 = d2.stats()
 
@@ -120,19 +120,26 @@ def calc_quality(img_dna):
 
 
 def prepare_dna(img):
-    vmin, vmax = auto_threshold(img)
-    img = np.where(img > vmin * 2, img, 0)
-    img = subtract_bg(img, 101)
+    vmin, vmax = auto_threshold(img, 3)
+    img = np.clip(img - float(vmin), 0, 65535).astype(np.uint16)
     mask = skimage.morphology.remove_small_objects(img > 0, 500)
-    img = np.where(mask, img, 0)
+    img[~mask] = 0
     return img
 
 
 def prepare_marker(img):
-    vmin, vmax = auto_threshold(img)
-    mask = img > vmin
-    mask = skimage.morphology.remove_small_objects(mask, 10)
-    img = np.where(mask, img, 0)
+    vmin, vmax = auto_threshold(img, 3)
+    img = np.clip(img - float(vmin), 0, 65535)
+    mask = skimage.morphology.remove_small_objects(img > 0, 10)
+    img[~mask] = 0
+    img = subtract_bg(img, 51)
+    return img
+
+
+def prepare_v5(img, parental_level):
+    img = np.clip(img - float(parental_level), 0, 65535).astype(np.uint16)
+    mask = skimage.morphology.remove_small_objects(img > 0, 10)
+    img[~mask] = 0
     img = subtract_bg(img, 51)
     return img
 
@@ -198,8 +205,7 @@ def process(args):
             img_dna_raw = imread(path_dna)
             quality = calc_quality(img_dna_raw)
             img_dna = prepare_dna(img_dna_raw)
-            img_v5 = imread(path_v5)
-            img_v5 = np.clip(img_v5.astype(float) - parental_v5, 0, 65535).astype(np.uint16)
+            img_v5 = prepare_v5(imread(path_v5), parental_v5)
             img_markers = [prepare_marker(imread(p)) for p in path_markers]
             ipairs = [
                 ("Hoechst33342", img_dna, path_dna),
@@ -213,7 +219,8 @@ def process(args):
                     # TODO: should the threshold be 100 or 0
                     # TODO: compute m2 also
                     m1 = skimage.measure.manders_coloc_coeff(img_v5, img > 0)
-                    m2 = skimage.measure.manders_coloc_coeff(img, img_v5 > 0)
+                    v5m = skimage.morphology.dilation(img_v5 > 0, skimage.morphology.disk(40))
+                    m2 = skimage.measure.manders_coloc_coeff(img, img_v5 > 0, v5m)
                 else:
                     r = np.nan
                     pvalue = np.nan
@@ -294,7 +301,7 @@ def main():
         df_test,
         (
             df_control
-            [df_control.quality > 5]
+            [(df_control.quality > 5) & (df_control.parental_v5 < 10_000)]
             .groupby('experiment')
             ['parental_v5']
             .median()
