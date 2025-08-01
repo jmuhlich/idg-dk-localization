@@ -83,7 +83,7 @@ def gmm_fit(img, n_components):
     return ((d1, w1), (d2, w2))
 
 
-def auto_threshold(img, n_components=2):
+def auto_threshold(img, n_components):
 
     ((d1, w1), (d2, w2)) = gmm_fit(img, n_components)
     mean1, std1 = d1.stats()
@@ -153,52 +153,22 @@ def prepare_dna(img):
 
 
 def prepare_marker(img):
-    vmin, vmax = auto_threshold(img, 3)
-    img = np.clip(img - float(vmin), 0, 65535).astype(np.uint16)
+    vmin1, _ = auto_threshold(img, 2)
+    img = np.clip(img - float(vmin1), 0, 65535).astype(np.uint16)
+    img = subtract_bg(img)
+    vmin2, _ = auto_threshold(img, 2)
+    img = np.clip(img - float(vmin2), 0, 65535).astype(np.uint16)
     mask = skimage.morphology.remove_small_objects(img > 0, 10)
     img[~mask] = 0
-    img = subtract_bg(img)
     return img
-
-# def prepare_marker_alt(img):
-#     vmin, vmax = auto_threshold(img, 3)
-#     img = np.clip(img - float(vmin), 0, 65535).astype(np.uint16)
-#     mask = skimage.morphology.remove_small_objects(img > 0, 10)
-#     img[~mask] = 0
-#     img = np.clip(img.astype(float) - cv2.medianBlur(img, 5), 0, np.inf).astype(np.uint16)
-#     return img
-
-# def prepare_marker_alt2(img):
-#     vmin, vmax = auto_threshold(img, 3)
-#     img = np.clip(img - float(vmin), 0, 65535).astype(np.uint16)
-#     mask = skimage.morphology.remove_small_objects(img > 0, 10)
-#     img[~mask] = 0
-#     elt = skimage.morphology.square(15)
-#     img = np.clip(img.astype(float) - skimage.filters.rank.median(img, elt), 0, np.inf).astype(np.uint16)
-#     return img
 
 
 def prepare_v5(img, parental_level):
     img = np.clip(img - float(parental_level), 0, 65535).astype(np.uint16)
+    img = subtract_bg(img)
     mask = skimage.morphology.remove_small_objects(img > 0, 10)
     img[~mask] = 0
-    img = subtract_bg(img)
     return img
-
-# def prepare_v5_alt(img, parental_level):
-#     img = np.clip(img - float(parental_level), 0, 65535).astype(np.uint16)
-#     mask = skimage.morphology.remove_small_objects(img > 0, 10)
-#     img[~mask] = 0
-#     img = np.clip(img.astype(float) - cv2.medianBlur(img, 5), 0, np.inf).astype(np.uint16)
-#     return img
-
-# def prepare_v5_alt2(img, parental_level):
-#     img = np.clip(img - float(parental_level), 0, 65535).astype(np.uint16)
-#     mask = skimage.morphology.remove_small_objects(img > 0, 10)
-#     img[~mask] = 0
-#     elt = skimage.morphology.square(15)
-#     img = np.clip(img.astype(float) - skimage.filters.rank.median(img, elt), 0, np.inf).astype(np.uint16)
-#     return img
 
 
 def phase_cross_correlation(a, b):
@@ -228,7 +198,7 @@ def calc_parental_v5_level(args):
     for pt in paths.itertuples():
         img_dna = imread(pt.Channel1)
         img_v5 = imread(pt.Channel2)
-        vmin_dna, vmax_dna = auto_threshold(img_dna)
+        vmin_dna, vmax_dna = auto_threshold(img_dna, 2)
         mask_dna = img_dna > vmin_dna
         mask_dna = skimage.morphology.remove_small_objects(mask_dna, 1000)
         log_v5 = np.log(img_v5[mask_dna])
