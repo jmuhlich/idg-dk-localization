@@ -1,4 +1,5 @@
 import concurrent.futures
+import cv2
 import itertools
 import multiprocessing
 import numpy as np
@@ -16,6 +17,17 @@ import sys
 import threadpoolctl
 import tqdm
 import tifffile
+
+
+class SerialExecutor:
+    def __init__(self):
+        pass
+    def map(self, process, args):
+        return map(process, args)
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return None
 
 
 def imread(path):
@@ -49,7 +61,7 @@ def gmm_fit(img, n_components):
 
     assert img.ndim == 2
 
-    yi, xi = np.floor(np.linspace(0, img.shape, 200, endpoint=False)).astype(int).T
+    yi, xi = np.floor(np.linspace(0, img.shape, 100, endpoint=False)).astype(int).T
     # Slice one dimension at a time. Should generally use less memory than a meshgrid.
     img = img[yi]
     img = img[:, xi]
@@ -108,9 +120,22 @@ def parse_paths(directory, well):
     return df
 
 
-def subtract_bg(img, block_size):
-    return np.clip(img - skimage.filters.threshold_local(img, block_size), 0, np.inf).astype(np.uint16)
+# def subtract_bg(img, block_size):
+#     return np.clip(img - skimage.filters.threshold_local(img, block_size), 0, np.inf).astype(np.uint16)
 
+def subtract_bg(img):
+    # OpenCV's medianBlur is very fast, but only supports apertures > 5px on
+    # uint8 images. We will log-transform our image (to preserve the dynamic
+    # range) and rescale it to uint8, compute the medianBlur, then reverse the
+    # transformation. The result is not completely equivalent to the true
+    # computation, but it's close enough for our needs.
+    factor = np.log(65535) / 255
+    img_log8 = (np.log(np.where(img, img, 1)) / factor).round().astype(np.uint8)
+    # Aperture of 15px corresponds to a diameter of ~5 microns as per Dunn 2011.
+    blur_log8 = cv2.medianBlur(img_log8, 15)
+    blur = np.exp(blur_log8 * factor)
+    subtracted = np.clip(img - blur, 0, 65535).astype(np.uint16)
+    return subtracted
 
 def calc_quality(img_dna):
     # quality = 5 seems to be a good cutoff based on visual inspection.
@@ -129,22 +154,54 @@ def prepare_dna(img):
 
 def prepare_marker(img):
     vmin, vmax = auto_threshold(img, 3)
-    img = np.clip(img - float(vmin), 0, 65535)
+    img = np.clip(img - float(vmin), 0, 65535).astype(np.uint16)
     mask = skimage.morphology.remove_small_objects(img > 0, 10)
     img[~mask] = 0
-    img = subtract_bg(img, 51)
+    img = subtract_bg(img)
     return img
+
+# def prepare_marker_alt(img):
+#     vmin, vmax = auto_threshold(img, 3)
+#     img = np.clip(img - float(vmin), 0, 65535).astype(np.uint16)
+#     mask = skimage.morphology.remove_small_objects(img > 0, 10)
+#     img[~mask] = 0
+#     img = np.clip(img.astype(float) - cv2.medianBlur(img, 5), 0, np.inf).astype(np.uint16)
+#     return img
+
+# def prepare_marker_alt2(img):
+#     vmin, vmax = auto_threshold(img, 3)
+#     img = np.clip(img - float(vmin), 0, 65535).astype(np.uint16)
+#     mask = skimage.morphology.remove_small_objects(img > 0, 10)
+#     img[~mask] = 0
+#     elt = skimage.morphology.square(15)
+#     img = np.clip(img.astype(float) - skimage.filters.rank.median(img, elt), 0, np.inf).astype(np.uint16)
+#     return img
 
 
 def prepare_v5(img, parental_level):
     img = np.clip(img - float(parental_level), 0, 65535).astype(np.uint16)
     mask = skimage.morphology.remove_small_objects(img > 0, 10)
     img[~mask] = 0
-    img = subtract_bg(img, 51)
+    img = subtract_bg(img)
     return img
 
+# def prepare_v5_alt(img, parental_level):
+#     img = np.clip(img - float(parental_level), 0, 65535).astype(np.uint16)
+#     mask = skimage.morphology.remove_small_objects(img > 0, 10)
+#     img[~mask] = 0
+#     img = np.clip(img.astype(float) - cv2.medianBlur(img, 5), 0, np.inf).astype(np.uint16)
+#     return img
 
-def pcc(a, b):
+# def prepare_v5_alt2(img, parental_level):
+#     img = np.clip(img - float(parental_level), 0, 65535).astype(np.uint16)
+#     mask = skimage.morphology.remove_small_objects(img > 0, 10)
+#     img[~mask] = 0
+#     elt = skimage.morphology.square(15)
+#     img = np.clip(img.astype(float) - skimage.filters.rank.median(img, elt), 0, np.inf).astype(np.uint16)
+#     return img
+
+
+def phase_cross_correlation(a, b):
     ccs = np.fft.ifft2(a * b.conj())
     ccsmax = ccs.max()
     aamp = np.sum(np.real(a * a.conj())) / a.size
@@ -191,11 +248,12 @@ def calc_parental_v5_level(args):
     return results
 
 
-def process(args):
+def calc_well_metrics(args):
     results = []
     try:
         plate, well, cell_line, marker1, marker2, parental_v5, directory = args
         df = parse_paths(directory, well)
+        m2_mask_elt = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81))
         if marker1 == 'blank':
             marker1 = marker2
             marker2 = None
@@ -216,16 +274,16 @@ def process(args):
             for marker, img, ipath in ipairs:
                 if img.any() and img_v5.any():
                     r, pvalue = scipy.stats.pearsonr(img_v5.ravel(), img.ravel())
-                    # TODO: should the threshold be 100 or 0
-                    # TODO: compute m2 also
                     m1 = skimage.measure.manders_coloc_coeff(img_v5, img > 0)
-                    v5m = skimage.morphology.dilation(img_v5 > 0, skimage.morphology.disk(40))
+                    v5m = cv2.dilate((img_v5 > 0).astype(np.uint8), m2_mask_elt)
                     m2 = skimage.measure.manders_coloc_coeff(img, img_v5 > 0, v5m)
+                    pcc = phase_cross_correlation(img_v5, img)
                 else:
                     r = np.nan
-                    pvalue = np.nan
+                    #pvalue = np.nan
                     m1 = np.nan
                     m2 = np.nan
+                    pcc = np.nan
                 v5_pos_count = np.sum(img_v5 > 0)
                 results.append({
                     "Plate": plate,
@@ -236,6 +294,7 @@ def process(args):
                     "R": r,
                     "M1": m1,
                     "M2": m2,
+                    "PCC": pcc,
                     "Quality": quality,
                     "V5ControlLevel": parental_v5,
                     "V5PositiveCount": v5_pos_count,
@@ -248,7 +307,8 @@ def process(args):
     return results
 
 
-def main():
+def setup():
+
     threadpoolctl.threadpool_limits(1)
 
     if hasattr(os, "sched_getaffinity"):
@@ -261,6 +321,12 @@ def main():
     out_control_path = pathlib.Path(sys.argv[3])
 
     assert out_path.suffix == '.csv', 'Output filename must end in .csv'
+    assert out_control_path.suffix == '.csv', 'Controls output filename must end in .csv'
+
+    return in_path, out_path, out_control_path, num_workers
+
+
+def load_metadata(in_path):
 
     df_in = pd.read_csv(in_path)
     base_path = in_path.resolve().parent
@@ -279,45 +345,59 @@ def main():
     df_in = df_in[df_in['tritc'] != 'EdU']
     assert (df_in['cy5'] != 'gH2AX').all()
 
-    # FIXME: subset for testing, delete later
-    #df_in = df_in[(df_in.plate.isin([10, 11])) | ((df_in.plate == 29) & (df_in.row.isin([1, 2])))]
-    #df_in = df_in[(df_in.plate.isin([9, 11, 17]))]
-    #df_in = df_in[df_in.plate == 17]
-    print(df_in.groupby(['plate', 'row']).size())
+    return df_in
 
-    is_parental = df_in['row'] == 1
-    df_parental = df_in[is_parental]
-    df_test = df_in[~is_parental]
 
-    p_args = df_parental[['plate', 'well', 'column', 'experiment', 'directory']].values
-    print('Computing V5 intensity levels in parental cell line controls')
-    with concurrent.futures.ThreadPoolExecutor(num_workers) as pool:
-        results = list(tqdm.tqdm(pool.map(calc_parental_v5_level, p_args), total=len(p_args)))
-    print()
-
+def compute_controls(df_parental, pool):
+    args = df_parental[['plate', 'well', 'column', 'experiment', 'directory']].values
+    results = list(tqdm.tqdm(pool.map(calc_parental_v5_level, args), total=len(args)))
     df_control = pd.DataFrame(itertools.chain.from_iterable(results))
-    df_control.to_csv(out_control_path, index=False)
-    df_test = pd.merge(
-        df_test,
-        (
-            df_control
-            [(df_control.quality > 5) & (df_control.parental_v5 < 10_000)]
-            .groupby('experiment')
-            ['parental_v5']
-            .median()
-            .reset_index()
-        )
-    )
+    qc_pass = (df_control.quality > 5) & (df_control.parental_v5 < 10_000)
+    df_control["qc_pass"] = qc_pass
+    return df_control
 
+
+def merge_parental_v5(df_test, df_control):
+    df_control_pass = df_control[df_control["qc_pass"]]
+    df_median_v5 = df_control_pass.groupby('experiment')['parental_v5'].median().reset_index()
+    df_test = pd.merge(df_test, df_median_v5)
+    return df_test
+
+
+def compute_metrics(df_test, pool):
     args = df_test[['plate', 'well', 'cell_line', 'tritc', 'cy5', 'parental_v5', 'directory']].values
-    print('Computing colocalization metrics')
-    with concurrent.futures.ThreadPoolExecutor(num_workers) as pool:
-        results = list(tqdm.tqdm(pool.map(process, args), total=len(args)))
-    print()
+    results = list(tqdm.tqdm(pool.map(calc_well_metrics, args), total=len(args)))
     rows = itertools.chain.from_iterable(results)
-    df_out = pd.DataFrame(rows)
+    df_metrics = pd.DataFrame(rows)
+    return df_metrics
 
-    df_out.to_csv(out_path, index=False)
+
+def main():
+
+    in_path, out_path, out_control_path, num_workers = setup()
+    pool = concurrent.futures.ThreadPoolExecutor(num_workers)
+    df_meta = load_metadata(in_path)
+
+    # FIXME: subset for testing, delete later
+    #df_meta = df_meta[(df_meta.plate.isin([10, 11])) | ((df_meta.plate == 29) & (df_meta.row.isin([1, 2])))]
+    #df_meta = df_meta[(df_meta.plate.isin([9, 11, 17]))]
+    df_meta = df_meta[df_meta.plate == 11]
+    print(df_meta.groupby(['plate', 'row']).size())
+
+    is_parental = df_meta['row'] == 1
+    df_parental = df_meta[is_parental]
+    df_test = df_meta[~is_parental]
+
+    print('Computing V5 intensity levels in parental cell line controls')
+    df_control = compute_controls(df_parental, pool)
+    df_control.to_csv(out_control_path, index=False)
+    print()
+
+    print('Computing colocalization metrics')
+    df_test = merge_parental_v5(df_test, df_control)
+    df_metrics = compute_metrics(df_test, pool)
+    df_metrics.to_csv(out_path, index=False)
+    print()
 
 
 if __name__  == "__main__":
