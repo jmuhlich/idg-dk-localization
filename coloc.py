@@ -1,9 +1,9 @@
+import cellpose.models
 import concurrent.futures
 import cv2
 import itertools
 import multiprocessing
 import numpy as np
-import ome_types
 import os
 import pandas as pd
 import pathlib
@@ -39,6 +39,7 @@ def imread(path):
     channel = channel[:-3]
     if tiff.series[0].shape != (2048, 2048):
         raise ValueError(f"Unexpected image dimensions: {tiff.series[0].shape}")
+    tiff.close()
     # Apply scale and shift (channel-dependent) to account for chromatic aberration. This is not
     # a great correction model but it seems good enough for our needs.
     if channel == "DAPI":
@@ -171,6 +172,25 @@ def prepare_v5(img, parental_level):
     return img
 
 
+def cellpose_eval(*args, **kwargs):
+    global cp
+    labels, _, _ = cp.eval(*args, **kwargs)
+    return labels
+
+
+def calc_v5_mask(img_dna_raw, img_v5_raw, parental_v5):
+    lmin, lmax = np.log(auto_threshold(img_v5_raw, 2))
+    v5s = np.clip((np.log(img_v5_raw) - lmin) / (lmax - lmin), 0, 1)
+    seg_in = np.dstack([skimage.img_as_float(img_dna_raw), v5s])
+    labels = cellpose_eval(seg_in, normalize=False, cellprob_threshold=-3, flow_threshold=1)
+    mask = np.zeros(labels.shape, bool)
+    regions = skimage.measure.regionprops(labels, img_v5_raw)
+    for r in regions:
+        if r.area > 400 and (r.intensity_mean + r.intensity_std) > parental_v5:
+            mask[r.slice][r.image] = True
+    return mask
+
+
 def phase_cross_correlation(a, b):
     ccs = np.fft.ifft2(a * b.conj())
     ccsmax = ccs.max()
@@ -202,8 +222,12 @@ def calc_parental_v5_level(args):
         mask_dna = img_dna > vmin_dna
         mask_dna = skimage.morphology.remove_small_objects(mask_dna, 1000)
         log_v5 = np.log(img_v5[mask_dna])
-        v5_mean = np.mean(log_v5)
-        v5_std = np.std(log_v5)
+        if log_v5.size > 0:
+            v5_mean = np.mean(log_v5)
+            v5_std = np.std(log_v5)
+        else:
+            v5_mean = np.nan
+            v5_std = np.nan
         v5_level = np.exp(v5_mean + v5_std * 3)
         quality = calc_quality(img_dna)
         results.append({
@@ -223,7 +247,6 @@ def calc_well_metrics(args):
     try:
         plate, well, cell_line, marker1, marker2, parental_v5, directory = args
         df = parse_paths(directory, well)
-        m2_mask_elt = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81))
         if marker1 == 'blank':
             marker1 = marker2
             marker2 = None
@@ -231,30 +254,35 @@ def calc_well_metrics(args):
             path_dna, path_v5, *path_markers = dfs.sort_values('Channel')['Path'].values
             assert (not marker2 and len(path_markers) == 1) or (marker2 and len(path_markers) == 2)
             img_dna_raw = imread(path_dna)
+            img_v5_raw = imread(path_v5)
             quality = calc_quality(img_dna_raw)
             img_dna = prepare_dna(img_dna_raw)
-            img_v5 = prepare_v5(imread(path_v5), parental_v5)
+            img_v5 = prepare_v5(img_v5_raw, parental_v5)
             img_markers = [prepare_marker(imread(p)) for p in path_markers]
             ipairs = [
                 ("Hoechst33342", img_dna, path_dna),
                 (marker1, img_markers[0], path_markers[0]),
             ]
+            v5_pos_count = np.sum(img_v5 > 0)
+            v5m = calc_v5_mask(img_dna_raw, img_v5_raw, parental_v5)
+            v5m_area = v5m.sum()
             if marker2:
                 ipairs.append((marker2, img_markers[1], path_markers[1]))
             for marker, img, ipath in ipairs:
-                if img.any() and img_v5.any():
-                    r, pvalue = scipy.stats.pearsonr(img_v5.ravel(), img.ravel())
+                if img.any() and v5m_area:
+                    img_m = img[v5m]
+                    if img_m.any():
+                        r, _ = scipy.stats.pearsonr(img_v5[v5m], img_m)
+                    else:
+                        r = np.nan
                     m1 = skimage.measure.manders_coloc_coeff(img_v5, img > 0)
-                    v5m = cv2.dilate((img_v5 > 0).astype(np.uint8), m2_mask_elt)
                     m2 = skimage.measure.manders_coloc_coeff(img, img_v5 > 0, v5m)
-                    pcc = phase_cross_correlation(img_v5, img)
+                    #pcc = phase_cross_correlation(img_v5, img)
                 else:
                     r = np.nan
-                    #pvalue = np.nan
                     m1 = np.nan
                     m2 = np.nan
-                    pcc = np.nan
-                v5_pos_count = np.sum(img_v5 > 0)
+                    #pcc = np.nan
                 results.append({
                     "Plate": plate,
                     "Well": well,
@@ -264,10 +292,11 @@ def calc_well_metrics(args):
                     "R": r,
                     "M1": m1,
                     "M2": m2,
-                    "PCC": pcc,
+                    #"PCC": pcc,
                     "Quality": quality,
                     "V5ControlLevel": parental_v5,
                     "V5PositiveCount": v5_pos_count,
+                    "V5MaskArea": v5m_area,
                     "PathV5": path_v5,
                     "Path": ipath,
                 })
@@ -278,6 +307,8 @@ def calc_well_metrics(args):
 
 
 def setup():
+
+    global cp
 
     threadpoolctl.threadpool_limits(1)
 
@@ -292,6 +323,8 @@ def setup():
 
     assert out_path.suffix == '.csv', 'Output filename must end in .csv'
     assert out_control_path.suffix == '.csv', 'Controls output filename must end in .csv'
+
+    cp = cellpose.models.CellposeModel(gpu=True)
 
     return in_path, out_path, out_control_path, num_workers
 
@@ -345,14 +378,14 @@ def compute_metrics(df_test, pool):
 def main():
 
     in_path, out_path, out_control_path, num_workers = setup()
-    pool = concurrent.futures.ThreadPoolExecutor(num_workers)
+    pool = concurrent.futures.ThreadPoolExecutor(min(num_workers, 8))
     df_meta = load_metadata(in_path)
 
     # FIXME: subset for testing, delete later
     #df_meta = df_meta[(df_meta.plate.isin([10, 11])) | ((df_meta.plate == 29) & (df_meta.row.isin([1, 2])))]
     #df_meta = df_meta[(df_meta.plate.isin([9, 11, 17]))]
-    df_meta = df_meta[df_meta.plate == 11]
-    print(df_meta.groupby(['plate', 'row']).size())
+    #df_meta = df_meta[df_meta.plate == 11]
+    #print(df_meta.groupby(['plate', 'row']).size())
 
     is_parental = df_meta['row'] == 1
     df_parental = df_meta[is_parental]
