@@ -1,5 +1,6 @@
 import dask.array as da
 import napari
+import numpy as np
 import pandas as pd
 import sys
 import tqdm
@@ -24,13 +25,18 @@ df = pd.read_csv(sys.argv[1])
 plate, row = sys.argv[2:]
 
 df = df[(df.Plate==int(plate)) & (df.Well.str.startswith(row))].copy()
+if len(df) == 0:
+    print("Requested plate and row are not present in the dataset")
+    sys.exit(1)
+
 df['Channel'] = df.Marker.map(marker_to_channel)
 
+wws = 400
 th, tw = coloc.imread(df.iloc[0].Path).shape
 wh = 3 if df.Site.max() <= 9 else 4
 ww = 3
 ih = wh * th
-iw = 12 * ww * tw
+iw = 12 * (ww * tw + wws)
 zimg = zarr.open_array(
     mode='w',
     shape=(4, ih, iw),
@@ -39,15 +45,15 @@ zimg = zarr.open_array(
 )
 
 loaded_v5 = set()
-for row in tqdm.tqdm(df.itertuples(), total=len(df), desc='loading images'):
-    col = int(row.Well[1:]) - 1
-    field = row.Site - 1
-    x = (col * ww + field % ww) * tw
+for t in tqdm.tqdm(df.itertuples(), total=len(df), desc='loading images'):
+    col = int(t.Well[1:]) - 1
+    field = t.Site - 1
+    x = (col * ww + field % ww) * tw + col * wws
     y = field // ww * th
-    zimg[row.Channel, y:y+th, x:x+tw] = coloc.imread(row.Path)
-    if row.PathV5 not in loaded_v5:
-        zimg[marker_to_channel['V5'], y:y+th, x:x+tw] = coloc.imread(row.PathV5)
-        loaded_v5.add(row.PathV5)
+    zimg[t.Channel, y:y+th, x:x+tw] = coloc.imread(t.Path)
+    if t.PathV5 not in loaded_v5:
+        zimg[marker_to_channel['V5'], y:y+th, x:x+tw] = coloc.imread(t.PathV5)
+        loaded_v5.add(t.PathV5)
 
 pyramids = []
 for i in tqdm.tqdm(range(zimg.shape[0]), desc='generating image pyramids'):
@@ -56,13 +62,91 @@ for i in tqdm.tqdm(range(zimg.shape[0]), desc='generating image pyramids'):
     p.append(p[1][::4, ::4].copy())
     pyramids.append(p)
 
+ew = 100
+ec = '#303030'
+bbox_rects = np.array([
+    [
+        [0 - ew / 2, x - ew / 2],
+        [wh * th + ew / 2, x + ww * tw + ew / 2],
+    ]
+    for x in np.arange(12) * (ww * tw + wws)
+])
+features = pd.DataFrame([{'Well': f'{row}{i:02}'} for i in range(1, 12 + 1)])
+well_markers = (
+    df.groupby(['Well', 'Marker', 'Channel'])
+    .first()
+    .index
+    .to_frame(index=False)
+    .pivot(index='Well', columns='Channel', values='Marker')
+    .reset_index()
+    .rename(columns={2: 'Marker1', 3: 'Marker2'})
+    .drop(columns=0)
+)
+features = pd.merge(features, well_markers, how='left').fillna('')
+text_parameters1 = {
+    'string': '{Well}',
+    'size': 24,
+    'color': '#ffffff',
+    'anchor': 'upper_left',
+    'translation': [-ew, 0],
+}
+text_parameters2 = {
+    'string': '{Marker1}\n ',
+    'size': 12,
+    'color': '#00ff00',
+    'anchor': 'upper_right',
+    'translation': [-ew, 0],
+}
+text_parameters3 = {
+    'string': '{Marker2}',
+    'size': 12,
+    'color': '#0080ff',
+    'anchor': 'upper_right',
+    'translation': [-ew, 0],
+}
+
 colors = ("gray", "red", "green", "bop blue")
+channels = ('Hoechst', 'V5', 'TRITC', 'Cy5')
+
+def update_thumbnail(layer):
+    layer.thumbnail = np.ones(layer._thumbnail_shape) * layer.colormap.map(0.7)
+
 viewer = napari.Viewer()
-for c, p in zip(colors, pyramids):
-    viewer.add_image(
+for c, n, p in zip(colors, channels, pyramids):
+    layer = viewer.add_image(
         p,
         contrast_limits=(0, 65535),
         colormap=c,
+        name=n,
         blending="additive",
     )
+    layer._update_thumbnail = update_thumbnail.__get__(layer)
+    layer._update_thumbnail()
+viewer.add_shapes(
+    bbox_rects,
+    face_color='transparent',
+    edge_color=ec,
+    edge_width=ew,
+    opacity=1,
+    features=features,
+    text=text_parameters1,
+    name='Annotations',
+)
+viewer.add_shapes(
+    bbox_rects,
+    face_color='transparent',
+    edge_color='transparent',
+    features=features,
+    text=text_parameters2,
+    name='TRITC Markers',
+)
+viewer.add_shapes(
+    bbox_rects,
+    face_color='transparent',
+    edge_color='transparent',
+    features=features,
+    text=text_parameters3,
+    name='Cy5 Markers',
+)
+viewer.layers.selection = []
 napari.run()
