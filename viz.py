@@ -3,6 +3,7 @@ import napari
 import numpy as np
 import pandas as pd
 import sys
+import tifffile
 import tqdm
 import zarr
 
@@ -22,12 +23,15 @@ marker_to_channel = {
 }
 
 df = pd.read_csv(sys.argv[1])
-plate, row = sys.argv[2:]
+dfs = pd.read_parquet(sys.argv[2]) if sys.argv[2].endswith('.parquet') else pd.read_csv(sys.argv[2])
+plate, row = sys.argv[3:]
 
 df = df[(df.Plate==int(plate)) & (df.Well.str.startswith(row))].copy()
 if len(df) == 0:
     print("Requested plate and row are not present in the dataset")
     sys.exit(1)
+dfs = dfs[(dfs.Plate==int(plate)) & (dfs.Well.str.startswith(row))].copy()
+dfs = pd.merge(df[['Plate', 'Well', 'Site']], dfs)
 
 df['Channel'] = df.Marker.map(marker_to_channel)
 
@@ -39,9 +43,15 @@ ih = wh * th
 iw = 12 * (ww * tw + wws)
 zimg = zarr.open_array(
     mode='w',
-    shape=(4, ih, iw),
+    shape=(4 * 2, ih, iw),
     chunks=(1, 512, 512),
     dtype='uint16',
+)
+zmask = zarr.open_array(
+    mode='w',
+    shape=(ih, iw),
+    chunks=(512, 512),
+    dtype='uint32',
 )
 
 loaded_v5 = set()
@@ -50,10 +60,18 @@ for t in tqdm.tqdm(df.itertuples(), total=len(df), desc='loading images'):
     field = t.Site - 1
     x = (col * ww + field % ww) * tw + col * wws
     y = field // ww * th
-    zimg[t.Channel, y:y+th, x:x+tw] = coloc.imread(t.Path)
+    field = coloc.imread(t.Path)
+    prep = coloc.prepare_dna if t.Marker == 'Hoechst33342' else coloc.prepare_marker
+    zimg[t.Channel, y:y+th, x:x+tw] = field
+    zimg[t.Channel + 4, y:y+th, x:x+tw] = prep(field)
     if t.PathV5 not in loaded_v5:
-        zimg[marker_to_channel['V5'], y:y+th, x:x+tw] = coloc.imread(t.PathV5)
+        ch_v5 = marker_to_channel['V5']
+        field = coloc.imread(t.PathV5)
+        zimg[ch_v5, y:y+th, x:x+tw] = field
+        zimg[ch_v5 + 4, y:y+th, x:x+tw] = coloc.prepare_v5(field, t.V5ControlLevel)
+        dfs.loc[(dfs.Site == t.Site) & (dfs.Well == t.Well), ['X', 'Y']] += [x, y]
         loaded_v5.add(t.PathV5)
+    zmask[y:y+th, x:x+tw] = tifffile.imread(f'out/masks/{t.Plate}/{t.Well}_{t.Site}.tif')
 
 pyramids = []
 for i in tqdm.tqdm(range(zimg.shape[0]), desc='generating image pyramids'):
@@ -61,6 +79,9 @@ for i in tqdm.tqdm(range(zimg.shape[0]), desc='generating image pyramids'):
     p.append(p[0][::4, ::4].compute())
     p.append(p[1][::4, ::4].copy())
     pyramids.append(p)
+mpyramid = [da.from_zarr(zmask, zarr_format=2)]
+mpyramid.append(mpyramid[0][::4, ::4].compute())
+mpyramid.append(mpyramid[1][::4, ::4].copy())
 
 ew = 100
 ec = '#303030'
@@ -107,21 +128,27 @@ text_parameters3 = {
 
 colors = ("gray", "red", "green", "bop blue")
 channels = ('Hoechst', 'V5', 'TRITC', 'Cy5')
+channels_raw = tuple(f'{c} (raw)' for c in channels)
 
 def update_thumbnail(layer):
     layer.thumbnail = np.ones(layer._thumbnail_shape) * layer.colormap.map(0.7)
 
 viewer = napari.Viewer()
-for c, n, p in zip(colors, channels, pyramids):
+for c, n, p in zip(colors * 2, channels_raw + channels, pyramids):
     layer = viewer.add_image(
         p,
         contrast_limits=(0, 65535),
         colormap=c,
         name=n,
-        blending="additive",
+        blending='additive',
+        visible='raw' not in n,
     )
     layer._update_thumbnail = update_thumbnail.__get__(layer)
     layer._update_thumbnail()
+viewer.add_labels(
+    mpyramid,
+    name='Segmentation',
+)
 viewer.add_shapes(
     bbox_rects,
     face_color='transparent',
@@ -130,7 +157,7 @@ viewer.add_shapes(
     opacity=1,
     features=features,
     text=text_parameters1,
-    name='Annotations',
+    name='Well Annotations',
 )
 viewer.add_shapes(
     bbox_rects,
@@ -147,6 +174,18 @@ viewer.add_shapes(
     features=features,
     text=text_parameters3,
     name='Cy5 Markers',
+)
+viewer.add_points(
+    dfs[['Y','X']],
+    face_color='transparent',
+    size=0,
+    features=dfs[['Label']],
+    text=dict(
+        string='{Label}',
+        size=12,
+        color='#ffffff',
+        anchor='center',
+    ),
 )
 viewer.layers.selection = []
 napari.run()
