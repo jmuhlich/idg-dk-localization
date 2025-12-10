@@ -1,6 +1,7 @@
 import concurrent.futures
 import napari
 import numpy as np
+import os
 import pandas as pd
 import sys
 import tifffile
@@ -44,8 +45,10 @@ iw = 12 * (ww * tw + wws)
 zimg = np.zeros( shape=(4 * 2, ih, iw), dtype='uint16')
 zmask = np.zeros( shape=(ih, iw), dtype='uint32')
 
+num_workers = min(len(os.sched_getaffinity(0)), 8)
+
 loaded_v5 = set()
-for t in tqdm.tqdm(df.itertuples(), total=len(df), desc='loading images'):
+def load(t):
     col = int(t.Well[1:]) - 1
     field = t.Site - 1
     x = (col * ww + field % ww) * tw + col * wws
@@ -62,6 +65,9 @@ for t in tqdm.tqdm(df.itertuples(), total=len(df), desc='loading images'):
         dfs.loc[(dfs.Site == t.Site) & (dfs.Well == t.Well), ['X', 'Y']] += [x, y]
         loaded_v5.add(t.PathV5)
     zmask[y:y+th, x:x+tw] = tifffile.imread(f'out/masks/{t.Plate}/{t.Well}_{t.Site}.tif')
+
+with concurrent.futures.ThreadPoolExecutor(num_workers) as pool:
+    list(tqdm.tqdm(pool.map(load, df.itertuples()), total=len(df), desc='loading images'))
 
 pyramids = []
 for i in tqdm.tqdm(range(zimg.shape[0]), desc='generating image pyramids'):
