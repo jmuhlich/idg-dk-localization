@@ -188,7 +188,15 @@ def calc_v5_mask(img_dna_raw, img_v5_raw, parental_v5):
     for r in regions:
         if r.area > 400 and r.intensity_mean > parental_v5:
             mask[r.slice][r.image] = True
-    return mask
+    return mask, labels
+
+
+def save_mask(plate, well, site, img):
+    dest = pathlib.Path(f'out/masks/{plate}/{well}_{site}.tif')
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(
+        dest, img, compression='zstd', predictor=True, rowsperstrip=img.shape[0],
+    )
 
 
 def phase_cross_correlation(a, b):
@@ -263,9 +271,11 @@ def calc_well_metrics(args):
                 ("Hoechst33342", img_dna, path_dna),
                 (marker1, img_markers[0], path_markers[0]),
             ]
-            v5_pos_count = np.sum(img_v5 > 0)
-            v5m = calc_v5_mask(img_dna_raw, img_v5_raw, parental_v5)
+            v5_pos_pixels = np.sum(img_v5 > 0)
+            v5m, labels = calc_v5_mask(img_dna_raw, img_v5_raw, parental_v5)
+            labels_positive = np.unique(labels[v5m])
             v5m_area = v5m.sum()
+            save_mask(plate, well, site, labels * v5m)
             if marker2:
                 ipairs.append((marker2, img_markers[1], path_markers[1]))
             for marker, img, ipath in ipairs:
@@ -283,20 +293,50 @@ def calc_well_metrics(args):
                     m1 = np.nan
                     m2 = np.nan
                     #pcc = np.nan
-                results.append({
+                props = skimage.measure.regionprops(labels, np.dstack([img_v5, img]))
+                cell_metrics = []
+                for p in props:
+                    cell_v5 = p.image_intensity[..., 0]
+                    cell_marker = p.image_intensity[..., 1]
+                    if cell_v5.any() and cell_marker.any():
+                        cr = scipy.stats.pearsonr(cell_v5.reshape(-1), cell_marker.reshape(-1))[0]
+                        cm1 = skimage.measure.manders_coloc_coeff(cell_v5, cell_marker > 0)
+                        cm2 = skimage.measure.manders_coloc_coeff(cell_marker, cell_v5 > 0)
+                    else:
+                        cr = np.nan
+                        cm1 = np.nan
+                        cm2 = np.nan
+                    cell_metrics.append({
+                        'Label': p.label,
+                        'X': p.centroid[1],
+                        'Y': p.centroid[0],
+                        'Area': p.area,
+                        'V5Positive': p.label in labels_positive,
+                        'V5IntensityMean': p.intensity_mean[0],
+                        'MarkerIntensityMean': p.intensity_mean[1],
+                        'R': cr,
+                        'M1': cm1,
+                        'M2': cm2,
+                    })
+                identifiers = {
                     "Plate": plate,
                     "Well": well,
-                    "CellLine": cell_line,
                     "Site": site,
                     "Marker": marker,
+                }
+                df_cell_metrics = pd.DataFrame(cell_metrics).assign(**identifiers)
+                results.append(identifiers | {
+                    "CellLine": cell_line,
                     "R": r,
                     "M1": m1,
                     "M2": m2,
                     #"PCC": pcc,
                     "Quality": quality,
                     "V5ControlLevel": parental_v5,
-                    "V5PositiveCount": v5_pos_count,
+                    "V5PositivePixels": v5_pos_pixels,
+                    "V5PositiveCells": len(labels_positive),
                     "V5MaskArea": v5m_area,
+                    "SingleCellMetrics": df_cell_metrics,
                     "PathV5": path_v5,
                     "Path": ipath,
                 })
@@ -306,7 +346,7 @@ def calc_well_metrics(args):
     return results
 
 
-def setup():
+def setup(argv=sys.argv):
 
     global cp
 
@@ -317,16 +357,18 @@ def setup():
     else:
         num_workers = multiprocessing.cpu_count()
 
-    in_path = pathlib.Path(sys.argv[1])
-    out_path = pathlib.Path(sys.argv[2])
-    out_control_path = pathlib.Path(sys.argv[3])
+    in_path = pathlib.Path(argv[1])
+    out_path = pathlib.Path(argv[2])
+    out_cell_path = pathlib.Path(argv[3])
+    out_control_path = pathlib.Path(argv[4])
 
     assert out_path.suffix == '.csv', 'Output filename must end in .csv'
+    assert out_cell_path.suffix == '.parquet', 'Single-cell output filename must end in .parquet'
     assert out_control_path.suffix == '.csv', 'Controls output filename must end in .csv'
 
     cp = cellpose.models.CellposeModel(gpu=True)
 
-    return in_path, out_path, out_control_path, num_workers
+    return in_path, out_path, out_cell_path, out_control_path, num_workers
 
 
 def load_metadata(in_path):
@@ -377,30 +419,37 @@ def compute_metrics(df_test, pool):
 
 def main():
 
-    in_path, out_path, out_control_path, num_workers = setup()
-    pool = concurrent.futures.ThreadPoolExecutor(min(num_workers, 8))
+    in_path, out_path, out_cell_path, out_control_path, num_workers = setup()
     df_meta = load_metadata(in_path)
 
     # FIXME: subset for testing, delete later
     #df_meta = df_meta[(df_meta.plate.isin([10, 11])) | ((df_meta.plate == 29) & (df_meta.row.isin([1, 2])))]
     #df_meta = df_meta[(df_meta.plate.isin([9, 11, 17]))]
     #df_meta = df_meta[df_meta.plate == 11]
+    #df_meta = df_meta[(df_meta.plate == 11) & df_meta.row.isin([1, 7]) & df_meta.column.isin([11, 12])]
+    #df_meta = df_meta[(df_meta.plate == 11) & df_meta.row.isin([1, 7]) & df_meta.column.isin([11])]
+    #df_meta = df_meta[(df_meta.plate == 11) & df_meta.row.isin([1, 7])]
     #print(df_meta.groupby(['plate', 'row']).size())
 
     is_parental = df_meta['row'] == 1
     df_parental = df_meta[is_parental]
     df_test = df_meta[~is_parental]
 
-    print('Computing V5 intensity levels in parental cell line controls')
-    df_control = compute_controls(df_parental, pool)
-    df_control.to_csv(out_control_path, index=False)
-    print()
+    with concurrent.futures.ThreadPoolExecutor(min(num_workers, 8)) as pool:
 
-    print('Computing colocalization metrics')
-    df_test = merge_parental_v5(df_test, df_control)
-    df_metrics = compute_metrics(df_test, pool)
-    df_metrics.to_csv(out_path, index=False)
-    print()
+        print('Computing V5 intensity levels in parental cell line controls')
+        df_control = compute_controls(df_parental, pool)
+        df_control.to_csv(out_control_path, index=False)
+        print()
+
+        print('Computing colocalization metrics')
+        df_test = merge_parental_v5(df_test, df_control)
+        df_metrics = compute_metrics(df_test, pool)
+        df_cell_metrics = pd.concat(df_metrics.SingleCellMetrics.values).reset_index(drop=True)
+        del df_metrics['SingleCellMetrics']
+        df_metrics.to_csv(out_path, index=False)
+        df_cell_metrics.to_parquet(out_cell_path, index=False)
+        print()
 
 
 if __name__  == "__main__":
