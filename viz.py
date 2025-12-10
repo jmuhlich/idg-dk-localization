@@ -1,11 +1,10 @@
-import dask.array as da
+import concurrent.futures
 import napari
 import numpy as np
 import pandas as pd
 import sys
 import tifffile
 import tqdm
-import zarr
 
 import coloc
 
@@ -32,6 +31,7 @@ if len(df) == 0:
     sys.exit(1)
 dfs = dfs[(dfs.Plate==int(plate)) & (dfs.Well.str.startswith(row))].copy()
 dfs = pd.merge(df[['Plate', 'Well', 'Site']], dfs)
+dfs['Label'] = dfs['Label'].astype(int)
 
 df['Channel'] = df.Marker.map(marker_to_channel)
 
@@ -41,18 +41,8 @@ wh = 3 if df.Site.max() <= 9 else 4
 ww = 3
 ih = wh * th
 iw = 12 * (ww * tw + wws)
-zimg = zarr.open_array(
-    mode='w',
-    shape=(4 * 2, ih, iw),
-    chunks=(1, 512, 512),
-    dtype='uint16',
-)
-zmask = zarr.open_array(
-    mode='w',
-    shape=(ih, iw),
-    chunks=(512, 512),
-    dtype='uint32',
-)
+zimg = np.zeros( shape=(4 * 2, ih, iw), dtype='uint16')
+zmask = np.zeros( shape=(ih, iw), dtype='uint32')
 
 loaded_v5 = set()
 for t in tqdm.tqdm(df.itertuples(), total=len(df), desc='loading images'):
@@ -75,13 +65,13 @@ for t in tqdm.tqdm(df.itertuples(), total=len(df), desc='loading images'):
 
 pyramids = []
 for i in tqdm.tqdm(range(zimg.shape[0]), desc='generating image pyramids'):
-    p = [da.from_zarr(zimg, zarr_format=2)[i]]
-    p.append(p[0][::4, ::4].compute())
-    p.append(p[1][::4, ::4].copy())
+    p = [zimg[i]]
+    for _ in range(4):
+        p.append(p[-1][::2, ::2].copy())
     pyramids.append(p)
-mpyramid = [da.from_zarr(zmask, zarr_format=2)]
-mpyramid.append(mpyramid[0][::4, ::4].compute())
-mpyramid.append(mpyramid[1][::4, ::4].copy())
+mpyramid = [zmask]
+for _ in range(4):
+    mpyramid.append(mpyramid[-1][::4, ::4].copy())
 
 ew = 100
 ec = '#303030'
@@ -177,8 +167,10 @@ viewer.add_shapes(
 )
 viewer.add_points(
     dfs[['Y','X']],
-    face_color='transparent',
+    face_color='white',
+    border_width=0,
     size=0,
+    antialiasing=0,
     features=dfs[['Label']],
     text=dict(
         string='{Label}',
@@ -186,6 +178,7 @@ viewer.add_points(
         color='#ffffff',
         anchor='center',
     ),
+    visible=False,
 )
 viewer.layers.selection = []
 napari.run()
