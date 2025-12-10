@@ -186,7 +186,7 @@ def calc_v5_mask(img_dna_raw, img_v5_raw, parental_v5):
     mask = np.zeros(labels.shape, bool)
     regions = skimage.measure.regionprops(labels, img_v5_raw)
     for r in regions:
-        if r.area > 400 and (r.intensity_mean + r.intensity_std) > parental_v5:
+        if r.area > 400 and r.intensity_mean > parental_v5:
             mask[r.slice][r.image] = True
     return mask
 
