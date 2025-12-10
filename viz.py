@@ -135,10 +135,12 @@ for c, n, p in zip(colors * 2, channels_raw + channels, pyramids):
     )
     layer._update_thumbnail = update_thumbnail.__get__(layer)
     layer._update_thumbnail()
-viewer.add_labels(
+labels_layer = viewer.add_labels(
     mpyramid,
     name='Segmentation',
+    visible=False,
 )
+labels_layer.contour = 1
 viewer.add_shapes(
     bbox_rects,
     face_color='transparent',
