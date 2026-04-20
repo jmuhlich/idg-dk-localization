@@ -1,15 +1,39 @@
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import scipy.stats
 import seaborn as sns
 import sklearn.cluster
 import sklearn.decomposition
 import sys
 
-marker_order = ["DNA", "b-tubulin", "GM-130", "LAMP", "lamin", "calnexin", "cytochromeC"]
+marker_order = ['DNA', 'GM-130', 'lamin', 'LAMP', 'b-tubulin', 'calnexin', 'cytochromeC', 'Membrane']
 
-dfc = pd.read_csv(sys.argv[1])
-dfm = pd.read_csv(sys.argv[2])
+if len(sys.argv) == 4:
+    path_control = sys.argv[1]
+    path_metrics = sys.argv[2]
+    path_metrics_cell = sys.argv[3]
+elif len(sys.argv) == 1:
+    ts = str(pd.Timestamp('now').date())
+    print(f"No inputs specified; defaulting to  output files from today ({ts})")
+    path_control = f"controls-{ts}.csv"
+    path_metrics = f"metrics-{ts}.csv"
+    path_metrics_cell = f"metrics-single-cell-{ts}.parquet"
+else:
+    print("Usage: plot-coloc.py [ctrl.csv metrics.csv metrics-sc.parquet]")
+    sys.exit(1)
+
+print("Input files:")
+print(f"  Control metrics, per field          - {path_control}")
+print(f"  Colocalization metrics, per field   - {path_metrics}")
+print(f"  Colocalization metrics, single-cell - {path_metrics_cell}")
+
+dfc = pd.read_csv(path_control)
+dfm = pd.read_csv(path_metrics)
+dfms = pd.read_parquet(path_metrics_cell)
+
+dfc['Column'] = dfc['Well'].str[1:].astype(int)
 
 dfm = pd.concat([dfm, dfm.Well.str.extract(r'(?P<Row>.)(?P<Column>..)')], axis=1)
 dfm['Marker'] = dfm['Marker'].replace('Hoechst33342', 'DNA')
@@ -17,62 +41,76 @@ dfm['RowName'] = dfm['Row']
 dfm['Row'] = dfm['Row'].map(ord) - ord('A') + 1
 dfm['Column'] = dfm['Column'].astype(int)
 
+dfm['CellLine'] = dfm['CellLine'].replace('2270 (2218c)', '2218c')
+dfm = dfm[dfm['CellLine'] != 'parental']
+
+cell_line_locations = dfm[['Plate','Well','CellLine']].value_counts().index.to_frame(index=False)
+cell_line_locations['PlateRowLine'] = (
+    cell_line_locations['Plate'].astype(str)
+    + cell_line_locations['Well'].str[0]
+    + ' '
+    + cell_line_locations['CellLine'].astype(str)
+)
+ignore_wells = dfm[~dfm['Marker'].isin(marker_order)][['Plate','Well']].drop_duplicates()
+cell_line_locations = (
+    pd.merge(cell_line_locations, ignore_wells, how='outer', indicator=True)
+    .query('_merge=="left_only"')
+    .drop(columns='_merge')
+)
+dfms['Marker'] = dfms['Marker'].replace('Hoechst33342', 'DNA')
+dfms = pd.merge(dfms, cell_line_locations)
+
+dfmsp = dfms[dfms.QcPass & dfms.V5Positive]
+
 # g = sns.FacetGrid(dfc.assign(plate=dfc.plate.astype('category'), color=(dfc.quality<5), x=(dfc.column+(dfc.site-1)%3/4), y=2-(dfc.site-1)//3), col='plate', col_wrap=5)
 # g.map_dataframe(sns.scatterplot, x='x', y='y', hue='color')
 # for ax in g.axes.ravel():
 #     ax.set_aspect(0.25)
 
-mask = (dfc.quality > 0) & (dfc.parental_v5 > 0)
 sns.jointplot(
-    x=np.log(dfc.quality[mask]),
-    y=np.log(dfc.parental_v5[mask]),
-    kind='hex',
+    dfc,
+    x='NumCells',
+    y='ParentalV5',
+    hue='QcPass',
+    kind='scatter',
+    alpha=0.3,
+    marginal_kws=dict(cut=0),
 )
 
-mask = (dfc.quality > 0) & (dfc.dna_positive > 0)
-sns.jointplot(
-    x=np.log(dfc.quality[mask]),
-    y=np.log(dfc.dna_positive[mask]),
-    kind='hex',
-)
-
-g = sns.FacetGrid(dfc, col='plate', col_wrap=min(dfc.plate.nunique(), 5))
-g.map_dataframe(
-    sns.boxplot,
-    x='column',
-    order=sorted(dfc.column.unique()),
-    y='parental_v5',
+sns.catplot(
+    dfc.assign(Column=dfc.Column.astype('category')),
+    col='Plate',
+    col_wrap=min(dfc.Plate.nunique(), 5),
+    x='Column',
+    hue='Column',
+    y='ParentalV5',
     log_scale=True,
+    kind='swarm',
+    size=3,
 )
 
-dfcq = dfc[dfc.quality>=25]
-g = sns.catplot(
-    pd.merge(
-        dfcq[['plate', 'column', 'experiment']].drop_duplicates(),
-        dfcq.groupby('experiment')['parental_v5'].median().reset_index(),
-    ),
-    col='plate',
-    col_wrap=min(dfc.plate.nunique(), 5),
-    x='column',
-    y='parental_v5',
-    height=1.5,
-    aspect=1.5,
+well_v5positive = (
+    dfms[(dfms.Marker=='DNA') & dfms.V5Positive]
+    .groupby(['Plate', 'Well'])
+    .size()
+    .map(np.log)
+    .rename('V5PositiveCount')
+    .reset_index()
 )
-plt.tight_layout()
+well_v5positive['Row'] = well_v5positive['Well'].str[0].map(ord) - ord('A') + 1
+well_v5positive['Column'] = well_v5positive['Well'].str[1:].astype(int)
 
-well_v5positive_mean = np.log(dfm.groupby(['Plate','Column','Row'])[['V5PositiveCount']].mean()).reset_index()
-well_v5positive_mean = well_v5positive_mean[well_v5positive_mean['V5PositiveCount'] != -np.inf]
 sm = plt.cm.ScalarMappable(
     cmap='summer',
     norm = plt.Normalize(
-        well_v5positive_mean.V5PositiveCount.min(),
-        well_v5positive_mean.V5PositiveCount.max(),
+        well_v5positive.V5PositiveCount.min(),
+        well_v5positive.V5PositiveCount.max(),
     ),
 )
 g = sns.FacetGrid(
-    well_v5positive_mean,
+    well_v5positive,
     col='Plate',
-    col_wrap=min(dfc.plate.nunique(), 5),
+    col_wrap=min(dfc.Plate.nunique(), 5),
     height=1.55,
 )
 g.map_dataframe(
@@ -95,27 +133,63 @@ g._legend.remove()
 cbar_ax = g.figure.add_axes([.92, 0.13, 0.015, 0.8])
 g.figure.colorbar(sm, cbar_ax, label='log( mean V5PositiveCount )')
 
-#dfm['ColFacet'] = 'CL=' + dfm.CellLine + ' P=' + dfm.Plate.astype(str)
-#dfmq = dfm[(dfm.Quality>30) & (dfm.V5PositiveCount>5000) & (dfm.Marker!='streptavidin')]
-dfmq = dfm[(dfm.Quality>100) & (dfm.V5PositiveCount/dfm.Quality>10) & (dfm.Marker!='streptavidin')]
-
-g = sns.catplot(dfmq, col='Plate', row='RowName', x='Marker', hue='Marker', y='M1')
-g.set_titles('{col_name} / {row_name}')
-g.tick_params(axis='x', rotation=90)
-g.figure.tight_layout()
+g = sns.catplot(
+    dfmsp,
+    col='PlateRowLine',
+    col_wrap=20,
+    x='M1',
+    hue='Marker',
+    y='Marker',
+    order=marker_order,
+    kind='violin',
+    inner=None,
+    linewidth=0,
+    cut=0,
+    aspect=1,
+)
+g.set_titles('{col_name}')
+for ax in g.axes:
+    ax.spines[:].set_visible(False)
+    ax.tick_params('y', length=0)
 
 dfmm = (
-    dfmq
-    .groupby(['Plate', 'CellLine', 'RowName', 'Marker'])
-    [['M1', 'M2', 'R']]
+    dfmsp
+    .groupby(['Plate', 'CellLine', 'PlateRowLine', 'Marker'])
+    [['M1', 'M2']]
     .median()
     .unstack('Marker')
+    .apply(scipy.stats.zscore, nan_policy='omit')
     .dropna()
     .stack(future_stack=True)
     .reset_index()
 )
-m1m = dfmm.set_index(['Plate', 'CellLine', 'RowName', 'Marker']).unstack('Marker')['M1'][marker_order]
-m1m_labels = sklearn.cluster.KMeans(n_clusters=6, n_init=10).fit(m1m).labels_
+m1m = dfmm.set_index(['PlateRowLine', 'Marker']).reindex(marker_order, level='Marker')[['M1','M2']].unstack('Marker')
+m1m = m1m['M1'] # TEMP will we use M2 here or not?
+# Next lines only needed if M2 is retained.
+# m1m.columns = ['-'.join(c) for c in m1m.columns]
+# m1m.columns.name = 'Marker'
+
+cell_count = (
+    m1m
+    .stack()
+    .sort_values(ascending=False)
+    .reset_index()
+    .drop_duplicates('PlateRowLine')
+    .set_index('PlateRowLine')[['Marker']]
+    .reset_index()
+    .merge(
+        dfmsp.groupby(['PlateRowLine', 'Marker']).size().rename('CellCount').reset_index()
+    )
+    .set_index('PlateRowLine')
+    .CellCount
+    .reindex_like(m1m)
+)
+
+# TEMP: random_state chosen to make the cluster containing the membrane-expressing lines end up with
+# label 0 so it's colored green in the Pastel2 cmap.
+m1m_cluster = sklearn.cluster.KMeans(n_clusters=6, n_init=10, random_state=0)
+m1m_cluster.fit(m1m, sample_weight=cell_count)
+m1m_labels = m1m_cluster.labels_
 m1mpca = sklearn.decomposition.PCA().fit(m1m)
 m1m_X_reduced = m1mpca.transform(m1m)
 
@@ -137,14 +211,14 @@ g = sns.catplot(
         m1mpca.components_.T,
         columns=range(1, m1mpca.n_components_ + 1)
     )
-    .set_axis(["-".join(x) for x in m1m.columns], axis="index")
+    .set_axis(m1m.columns, axis="index")
     .loc[:, 1:4]
     .stack()
-    .rename_axis(index=['Metric-Marker','PC'])
+    .rename_axis(index=['Metric','PC'])
     .rename('Loading')
     .reset_index(),
     row='PC',
-    x='Metric-Marker',
+    x='Metric',
     y='Loading',
     kind='bar',
     aspect=3,
@@ -166,26 +240,125 @@ ax = sns.scatterplot(
     x="PC_1",
     y="PC_2",
     hue='Cluster',
-    palette='Set1',
+    palette='Pastel2',
 )
-ax.set_title("PCA first 2 dimensions");
+ax.set_title("PCA first 2 dimensions")
 
 g = sns.catplot(
     m1m
     .assign(Cluster=m1m_labels)
     .set_index('Cluster', append=True)
-    .set_axis(["-".join(x) for x in m1m.columns], axis="columns")
+    .set_axis(m1m.columns, axis="columns")
     .stack()
-    .rename_axis(index={None: "Metric-Marker"})
+    .rename_axis(index={None: "Marker"})
     .rename("Value")
     .reset_index(),
     col='Cluster',
     col_wrap=3,
     hue='Cluster',
-    x='Metric-Marker',
+    x='Marker',
     y='Value',
-    palette='Set1')
-g.map_dataframe(sns.pointplot, x='Metric-Marker', y='Value', color='black', lw=1)
-#for ax in g.axes:
-#    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', rotation_mode='anchor')
+    palette='Pastel2')
+g.map_dataframe(sns.pointplot, x='Marker', y='Value', color='black', lw=1)
+for ax in g.axes:
+    ax.xaxis.set_tick_params(rotation=45)
 g.figure.tight_layout()
+
+is_maybe_membrane = [
+    '14F 2270c', '15C 2067', '15D 2068', '15G 2135', '22G 2031', '23E 2412', '23F 2413', '23G 2414',
+    '23H 1462', '26D 1736', '26F 1759', '25C 1758', '20B 1273', '21C 2135', '30H 2289', '31D 1465',
+]
+is_membrane = [
+    '14F 2270c', '15C 2067', '15D 2068', '15G 2135', '23E 2412', '23F 2413', '23G 2414', '26F 1759', '25C 1758',
+]
+best_m1_marker = (
+    m1m
+    .stack()
+    .sort_values(ascending=False)
+    .reset_index()
+    .drop_duplicates('PlateRowLine')
+    .set_index('PlateRowLine')
+    ['Marker']
+)
+cell_count_cmap = mpl.cm.ScalarMappable(
+    mpl.colors.LogNorm(vmin=cell_count.min(), vmax=cell_count.max()),
+    cmap='pink_r',
+)
+best_m1_marker_cmap = dict(zip(marker_order, sns.color_palette('Set1', len(marker_order))))
+cluster_label_cmap = dict(zip(sorted(set(m1m_labels)), sns.color_palette('Pastel2', len(set(m1m_labels)))))
+clustermap_row_colors = pd.concat(
+    [
+        pd.DataFrame(index=is_membrane).assign(Membrane='seagreen'),
+        # pd.DataFrame(index=is_maybe_membrane).assign(maybe_Membrane='darkgreen'),
+        pd.DataFrame({
+            'KMeansCluster': m1m.assign(Cluster=m1m_labels)['Cluster'].map(cluster_label_cmap),
+            'BestM1': best_m1_marker.map(best_m1_marker_cmap.get),
+            'CellCount': cell_count.map(cell_count_cmap.to_rgba),
+        }),
+    ],
+    axis=1,
+)
+
+# Explicitly calculate distance matrix so we can explicitly impose a high distance between members
+# of different k-means clusters.
+dist = scipy.spatial.distance.squareform(scipy.spatial.distance.pdist(m1m))
+max_intra_dist = 0.0
+for i1, m1 in enumerate(m1m.index):
+    for i2, m2 in enumerate(m1m.index):
+        c1 = m1m_labels[i1]
+        c2 = m1m_labels[i2]
+        if c1 != c2:
+            # Different cluster, flag with nan for later backfilling.
+            dist[i1, i2] = np.nan
+        else:
+            # Same cluster, keep track of highest seen distance.
+            max_intra_dist = max(max_intra_dist, dist[i1, i2])
+# Fill all inter-cluster entries with the maximum intra-cluster distance. This should be enough to
+# force each k-means cluster into its own hierarchical cluster branch (with some variance across
+# different linkage methods).
+dist[np.isnan(dist)] = max_intra_dist
+row_linkage = scipy.cluster.hierarchy.linkage(
+    scipy.spatial.distance.squareform(dist), method='average'
+)
+
+g = sns.clustermap(
+    m1m,
+    center=0,
+    xticklabels=True,
+    yticklabels=True,
+    linewidth=0,
+    figsize=(5,13),
+    row_colors=clustermap_row_colors,
+    row_linkage=row_linkage,
+    col_cluster=False,
+)
+g.ax_heatmap.yaxis.set_tick_params(labelsize=5)
+g.ax_heatmap.xaxis.set_tick_params(labelsize=10)
+g.ax_row_colors.xaxis.set_tick_params(labelsize=5)
+plt.legend(
+    [mpl.patches.Patch(facecolor=c) for c in best_m1_marker_cmap.values()],
+    best_m1_marker_cmap.keys(),
+    title='Best M1',
+    bbox_to_anchor=(1, 1),
+    bbox_transform=plt.gcf().transFigure,
+    loc='upper right',
+)
+plt.colorbar(cell_count_cmap, ax=g.ax_col_dendrogram, shrink=0.9, label='CellCount', location='left')
+
+'''
+import imageio.v3
+from PIL import Image, ImageDraw, ImageFont
+fnt = ImageFont.truetype("Pillow/Tests/fonts/FreeMono.ttf", 30)
+def draw_label(s):
+    img = Image.new("RGB", (175,175), (0, 0, 0))
+    ImageDraw.Draw(img).text((10, 175/2), s, anchor='lm', font=fnt, fill=(255,255,255))
+    return np.array(img)
+gallery_img = np.vstack([
+    np.hstack([
+        draw_label(f"{prl}\n{m}"),
+        imageio.v3.imread(f"out/figures/{prl} {m}.jpg"),
+    ])
+    for prl, m in best_m1_marker.loc[m1m.index[g.dendrogram_row.reordered_ind]].items()
+])
+imageio.v3.imwrite('out/heatmap_gallery.png', gallery_img)
+'''

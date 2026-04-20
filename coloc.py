@@ -178,11 +178,12 @@ def cellpose_eval(*args, **kwargs):
     return labels
 
 
-def calc_v5_mask(img_dna_raw, img_v5_raw, parental_v5):
-    lmin, lmax = np.log(auto_threshold(img_v5_raw, 2))
-    v5s = np.clip((np.log(img_v5_raw) - lmin) / (lmax - lmin), 0, 1)
-    seg_in = np.dstack([skimage.img_as_float(img_dna_raw), v5s])
-    labels = cellpose_eval(seg_in, normalize=False, cellprob_threshold=-3, flow_threshold=1)
+def calc_v5_mask(img_dna_raw, img_v5_raw, parental_v5, labels=None):
+    if labels is None:
+        lmin, lmax = np.log(auto_threshold(img_v5_raw, 2))
+        v5s = np.clip((np.log(img_v5_raw) - lmin) / (lmax - lmin), 0, 1)
+        seg_in = np.dstack([skimage.img_as_float(img_dna_raw), v5s])
+        labels = cellpose_eval(seg_in, normalize=False, cellprob_threshold=-3, flow_threshold=1)
     mask = np.zeros(labels.shape, bool)
     regions = skimage.measure.regionprops(labels, img_v5_raw)
     for r in regions:
@@ -191,12 +192,26 @@ def calc_v5_mask(img_dna_raw, img_v5_raw, parental_v5):
     return mask, labels
 
 
+def calc_membrane_mask(labels):
+    mask = labels > 0
+    props = skimage.measure.regionprops(labels)
+    fp = skimage.morphology.disk(1)
+    for p in props:
+        cmask = skimage.morphology.erosion(p.image_filled, fp)
+        mask[p.slice][cmask] = 0
+    return mask
+
+
 def save_mask(plate, well, site, img):
     dest = pathlib.Path(f'out/masks/{plate}/{well}_{site}.tif')
     dest.parent.mkdir(parents=True, exist_ok=True)
     tifffile.imwrite(
         dest, img, compression='zstd', predictor=True, rowsperstrip=img.shape[0],
     )
+
+
+def load_mask(plate, well, site):
+    return tifffile.imread(f'out/masks/{plate}/{well}_{site}.tif')
 
 
 def phase_cross_correlation(a, b):
@@ -212,7 +227,7 @@ def phase_cross_correlation(a, b):
 
 
 def calc_parental_v5_level(args):
-    plate, well, column, experiment, directory = args
+    plate, well, experiment, directory = args
     df = parse_paths(directory, well)
     df = df[df['Channel'].isin([1, 2])]
     paths = (
@@ -236,16 +251,54 @@ def calc_parental_v5_level(args):
         else:
             v5_mean = np.nan
             v5_std = np.nan
-        v5_level = np.exp(v5_mean + v5_std * 3)
+        v5_level_old = np.exp(v5_mean + v5_std * 3)
         quality = calc_quality(img_dna)
-        results.append({
-            'plate': plate,
-            'column': column,
-            'experiment': experiment,
-            'site': pt.Site,
-            'parental_v5': v5_level,
-            'dna_positive': np.sum(mask_dna),
-            'quality': quality,
+        try:
+            labels_pre = load_mask(plate, well, pt.Site)
+        except FileNotFoundError:
+            labels_pre = None
+        mask, labels = calc_v5_mask(img_dna, img_v5, 0, labels=labels_pre)
+        if labels_pre is None:
+            save_mask(plate, well, pt.Site, labels)
+        props = skimage.measure.regionprops(labels, np.dstack([img_v5, img_dna]))
+        cell_metrics = []
+        for p in props:
+            cell_dna_mean = p.intensity_mean[1]
+            cell_dna_sum = p.intensity_mean[1] * p.area
+            # QC conditions determined from initial review of the data.
+            qc_pass = (cell_dna_mean > 2000) & (600 < p.area < 4500) & (7e6 < cell_dna_sum < 32e6)
+            if ~qc_pass:
+                mask[p.slice][p.image] = 0
+            cell_metrics.append({
+                'Label': p.label,
+                'X': p.centroid[1],
+                'Y': p.centroid[0],
+                'Area': p.area,
+                'V5IntensityMean': p.intensity_mean[0],
+                'DNAIntensityMean': cell_dna_mean,
+                'DNAIntensitySum': cell_dna_sum,
+                'QcPass': qc_pass,
+            })
+        v5_pass = img_v5[mask]
+        if len(v5_pass):
+            v5_level = np.percentile(v5_pass, 99.9)
+        else:
+            v5_level = np.nan
+        identifiers = {
+            "Plate": plate,
+            "Well": well,
+            "Site": pt.Site,
+        }
+        df_cell_metrics = pd.DataFrame(cell_metrics).assign(**identifiers)
+        num_cells = df_cell_metrics['QcPass'].sum() if len(df_cell_metrics) else 0
+        results.append(identifiers | {
+            'Experiment': experiment,
+            'ParentalV5': v5_level,
+            'ParentalV5Old': v5_level_old,
+            'DNAPositive': np.sum(mask_dna),
+            'Quality': quality,
+            'NumCells': num_cells,
+            'SingleCellMetrics': df_cell_metrics,
         })
     return results
 
@@ -267,17 +320,37 @@ def calc_well_metrics(args):
             img_dna = prepare_dna(img_dna_raw)
             img_v5 = prepare_v5(img_v5_raw, parental_v5)
             img_markers = [prepare_marker(imread(p)) for p in path_markers]
+            # Small hack to grab raw EdU image for a separate non-colocalization metric.
+            if marker1 == 'EdU':
+                img_edu_raw = imread(path_markers[0])
+            assert marker2 != 'EdU', 'Unexpectedly found EdU in cy5 channel'
             ipairs = [
                 ("Hoechst33342", img_dna, path_dna),
                 (marker1, img_markers[0], path_markers[0]),
             ]
-            v5_pos_pixels = np.sum(img_v5 > 0)
-            v5m, labels = calc_v5_mask(img_dna_raw, img_v5_raw, parental_v5)
-            labels_positive = np.unique(labels[v5m])
-            v5m_area = v5m.sum()
-            save_mask(plate, well, site, labels * v5m)
             if marker2:
                 ipairs.append((marker2, img_markers[1], path_markers[1]))
+            v5_pos_pixels = np.sum(img_v5 > 0)
+            try:
+                labels_pre = load_mask(plate, well, site)
+            except FileNotFoundError:
+                labels_pre = None
+            v5m, labels = calc_v5_mask(img_dna_raw, img_v5_raw, parental_v5, labels=labels_pre)
+            img_membrane = calc_membrane_mask(labels)
+            ipairs.append(('Membrane', img_membrane, None))
+            labels_positive = np.unique(labels[v5m])
+            v5m_area = v5m.sum()
+            if labels_pre is None:
+                save_mask(plate, well, site, labels)
+            qc_props = skimage.measure.regionprops(labels, img_dna_raw)
+            cell_qc = {}
+            for p in qc_props:
+                cell_dna_mean = p.intensity_mean
+                cell_dna_sum = p.intensity_mean * p.area
+                # QC conditions determined from initial review of the data.
+                qc_pass = (cell_dna_mean > 2000) & (600 < p.area < 4500) & (7e6 < cell_dna_sum < 32e6)
+                cell_qc[p.label] = qc_pass
+
             for marker, img, ipath in ipairs:
                 if img.any() and v5m_area:
                     img_m = img[v5m]
@@ -294,10 +367,20 @@ def calc_well_metrics(args):
                     m2 = np.nan
                     #pcc = np.nan
                 props = skimage.measure.regionprops(labels, np.dstack([img_v5, img]))
+                cc_metrics = {}
+                if marker == 'EdU':
+                    cc_props = skimage.measure.regionprops(labels, img_edu_raw)
+                    for pq, pc in zip(qc_props, cc_props):
+                        cc_metrics[pq.label] = {
+                            'DNAIntensitySum': pq.intensity_mean * pq.area,
+                            'EdUIntensitySum': pc.intensity_mean * pq.area,
+                        }
                 cell_metrics = []
                 for p in props:
                     cell_v5 = p.image_intensity[..., 0]
                     cell_marker = p.image_intensity[..., 1]
+                    qc_pass = cell_qc[p.label]
+                    v5_positive = np.sum(cell_v5 > 0) / p.area > 0.05
                     if cell_v5.any() and cell_marker.any():
                         cr = scipy.stats.pearsonr(cell_v5.reshape(-1), cell_marker.reshape(-1))[0]
                         cm1 = skimage.measure.manders_coloc_coeff(cell_v5, cell_marker > 0)
@@ -306,18 +389,22 @@ def calc_well_metrics(args):
                         cr = np.nan
                         cm1 = np.nan
                         cm2 = np.nan
-                    cell_metrics.append({
-                        'Label': p.label,
-                        'X': p.centroid[1],
-                        'Y': p.centroid[0],
-                        'Area': p.area,
-                        'V5Positive': p.label in labels_positive,
-                        'V5IntensityMean': p.intensity_mean[0],
-                        'MarkerIntensityMean': p.intensity_mean[1],
-                        'R': cr,
-                        'M1': cm1,
-                        'M2': cm2,
-                    })
+                    cell_metrics.append(
+                        {
+                            'Label': p.label,
+                            'X': p.centroid[1],
+                            'Y': p.centroid[0],
+                            'Area': p.area,
+                            'QcPass': qc_pass,
+                            'V5Positive': v5_positive,
+                            'V5IntensityMean': p.intensity_mean[0],
+                            'MarkerIntensityMean': p.intensity_mean[1],
+                            'R': cr,
+                            'M1': cm1,
+                            'M2': cm2,
+                        }
+                        | cc_metrics.get(p.label, {})
+                    )
                 identifiers = {
                     "Plate": plate,
                     "Well": well,
@@ -342,7 +429,6 @@ def calc_well_metrics(args):
                 })
     except Exception as e:
         print(f"ERROR: process({args}) : {e}")
-        pass
     return results
 
 
@@ -357,18 +443,39 @@ def setup(argv=sys.argv):
     else:
         num_workers = multiprocessing.cpu_count()
 
-    in_path = pathlib.Path(argv[1])
-    out_path = pathlib.Path(argv[2])
-    out_cell_path = pathlib.Path(argv[3])
-    out_control_path = pathlib.Path(argv[4])
+    if len(sys.argv) == 6:
+        in_path = pathlib.Path(argv[1])
+        out_path = pathlib.Path(argv[2])
+        out_cell_path = pathlib.Path(argv[3])
+        out_control_path = pathlib.Path(argv[4])
+        out_cell_control_path = pathlib.Path(argv[5])
+    elif len(sys.argv) == 2:
+        in_path = pathlib.Path(argv[1])
+        print("Generating output filenames automatically")
+        ts = str(pd.Timestamp('now').date())
+        out_path = pathlib.Path(f"metrics-{ts}.csv")
+        out_cell_path = pathlib.Path(f"metrics-single-cell-{ts}.parquet")
+        out_control_path = pathlib.Path(f"controls-{ts}.csv")
+        out_cell_control_path = pathlib.Path(f"controls-single-cell-{ts}.parquet")
+    else:
+        print("Usage: coloc.py in.csv [metrics.csv metrics-sc.parquet ctrl.csv ctrl-sc.parquet]")
+        sys.exit(1)
 
     assert out_path.suffix == '.csv', 'Output filename must end in .csv'
     assert out_cell_path.suffix == '.parquet', 'Single-cell output filename must end in .parquet'
     assert out_control_path.suffix == '.csv', 'Controls output filename must end in .csv'
+    assert out_cell_control_path.suffix == '.parquet', 'Single-cell controls output filename must end in .parquet'
+
+    print("Output files:")
+    print(f"  Colocalization metrics, per field   - {out_path}")
+    print(f"  Colocalization metrics, single-cell - {out_cell_path}")
+    print(f"  Control metrics, per field          - {out_control_path}")
+    print(f"  Control metrics, single-cell        - {out_cell_control_path}")
+    print()
 
     cp = cellpose.models.CellposeModel(gpu=True)
 
-    return in_path, out_path, out_cell_path, out_control_path, num_workers
+    return in_path, out_path, out_cell_path, out_control_path, out_cell_control_path, num_workers
 
 
 def load_metadata(in_path):
@@ -385,32 +492,29 @@ def load_metadata(in_path):
         ((df_in['cell_line'] == 'parental') ^ (df_in['row'] == 1))
         & ~((df_in['plate'] == 8) & df_in['row'].isin([7, 8]))
     ]) == 0, 'parental lines out of place'
-
-    # Filter out EdU/gH2AX wells -- not used for colocalization.
-    df_in = df_in[df_in['tritc'] != 'EdU']
-    assert (df_in['cy5'] != 'gH2AX').all()
+    df_in.loc[df_in['cy5'].isna(), 'cy5'] = None
 
     return df_in
 
 
 def compute_controls(df_parental, pool):
-    args = df_parental[['plate', 'well', 'column', 'experiment', 'directory']].values
+    args = df_parental[['plate', 'well', 'experiment', 'directory']].values
     results = list(tqdm.tqdm(pool.map(calc_parental_v5_level, args), total=len(args)))
     df_control = pd.DataFrame(itertools.chain.from_iterable(results))
-    qc_pass = (df_control.quality > 5) & (df_control.parental_v5 < 10_000)
-    df_control["qc_pass"] = qc_pass
+    qc_pass = (df_control.NumCells > 10) & (df_control.ParentalV5 < 10_000)
+    df_control["QcPass"] = qc_pass
     return df_control
 
 
 def merge_parental_v5(df_test, df_control):
-    df_control_pass = df_control[df_control["qc_pass"]]
-    df_median_v5 = df_control_pass.groupby('experiment')['parental_v5'].median().reset_index()
-    df_test = pd.merge(df_test, df_median_v5)
+    df_control_pass = df_control[df_control["QcPass"]]
+    df_median_v5 = df_control_pass.groupby('Experiment')['ParentalV5'].median().reset_index()
+    df_test = pd.merge(df_test, df_median_v5, left_on='experiment', right_on='Experiment')
     return df_test
 
 
 def compute_metrics(df_test, pool):
-    args = df_test[['plate', 'well', 'cell_line', 'tritc', 'cy5', 'parental_v5', 'directory']].values
+    args = df_test[['plate', 'well', 'cell_line', 'tritc', 'cy5', 'ParentalV5', 'directory']].values
     results = list(tqdm.tqdm(pool.map(calc_well_metrics, args), total=len(args)))
     rows = itertools.chain.from_iterable(results)
     df_metrics = pd.DataFrame(rows)
@@ -419,16 +523,18 @@ def compute_metrics(df_test, pool):
 
 def main():
 
-    in_path, out_path, out_cell_path, out_control_path, num_workers = setup()
+    in_path, out_path, out_cell_path, out_control_path, out_cell_control_path, num_workers = setup()
     df_meta = load_metadata(in_path)
 
     # FIXME: subset for testing, delete later
     #df_meta = df_meta[(df_meta.plate.isin([10, 11])) | ((df_meta.plate == 29) & (df_meta.row.isin([1, 2])))]
-    #df_meta = df_meta[(df_meta.plate.isin([9, 11, 17]))]
+    #df_meta = df_meta[(df_meta.plate.isin([14, 15, 22, 23, 26]))]
     #df_meta = df_meta[df_meta.plate == 11]
     #df_meta = df_meta[(df_meta.plate == 11) & df_meta.row.isin([1, 7]) & df_meta.column.isin([11, 12])]
     #df_meta = df_meta[(df_meta.plate == 11) & df_meta.row.isin([1, 7]) & df_meta.column.isin([11])]
     #df_meta = df_meta[(df_meta.plate == 11) & df_meta.row.isin([1, 7])]
+    #df_meta = df_meta[(df_meta.plate == 15)]
+    #df_meta = df_meta.query("plate==23 & column==4 & row<=2")
     #print(df_meta.groupby(['plate', 'row']).size())
 
     is_parental = df_meta['row'] == 1
@@ -436,10 +542,14 @@ def main():
     df_test = df_meta[~is_parental]
 
     with concurrent.futures.ThreadPoolExecutor(min(num_workers, 8)) as pool:
+    #with SerialExecutor() as pool:
 
         print('Computing V5 intensity levels in parental cell line controls')
         df_control = compute_controls(df_parental, pool)
+        df_cell_control = pd.concat(df_control.SingleCellMetrics.values).reset_index(drop=True)
+        del df_control['SingleCellMetrics']
         df_control.to_csv(out_control_path, index=False)
+        df_cell_control.to_parquet(out_cell_control_path, index=False)
         print()
 
         print('Computing colocalization metrics')

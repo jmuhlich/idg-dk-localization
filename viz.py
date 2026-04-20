@@ -3,6 +3,7 @@ import napari
 import numpy as np
 import os
 import pandas as pd
+import pathlib
 import sys
 import tifffile
 import tqdm
@@ -14,6 +15,8 @@ marker_to_channel = {
     'Hoechst33342': 0,
     'V5': 1,
     'streptavidin': 3,
+    'EdU': 2,
+    'gH2AX': 3,
     'LAMP': 2,
     'lamin': 3,
     'b-tubulin': 2,
@@ -21,12 +24,43 @@ marker_to_channel = {
     'calnexin': 2,
     'cytochromeC': 3,
 }
+channel_to_marker = {
+    0: 'Hoechst33342',
+    1: 'V5',
+    2: 'TRITC',
+    3: 'Cy5',
+}
 
 df = pd.read_csv(sys.argv[1])
 dfs = pd.read_parquet(sys.argv[2]) if sys.argv[2].endswith('.parquet') else pd.read_csv(sys.argv[2])
 plate, row = sys.argv[3:]
 
-df = df[(df.Plate==int(plate)) & (df.Well.str.startswith(row))].copy()
+base = pathlib.Path(sys.argv[1]).parent
+
+if row == 'A':
+    v5control = True
+    df = df[df.Plate == int(plate)]
+    #df['Well'] = 'A' + df['column'].astype(str).str.zfill(2)
+    dfwe = df[['Well', 'Experiment']].value_counts().index.to_frame(index=False)
+    df = pd.concat([
+        coloc.parse_paths(base / 'in' / r.Experiment, r.Well)
+        #.query('Channel in (1,2)')
+        .assign(Well=r.Well, Plate=int(plate))
+        for r in dfwe.itertuples()
+    ])
+    df.Channel -= 1
+    df['Marker'] = df.Channel.map(channel_to_marker)
+    df = pd.merge(
+        df,
+        df.loc[df.Channel==1, ['Plate', 'Well', 'Site', 'Path']],
+        on=['Plate', 'Well', 'Site'],
+        suffixes=['', 'V5'],
+    )
+else:
+    v5control = False
+    df = df[(df.Plate == int(plate)) & (df.Well.str.startswith(row)) & df.Path.notna()].copy()
+    df['Channel'] = df.Marker.map(marker_to_channel)
+
 if len(df) == 0:
     print("Requested plate and row are not present in the dataset")
     sys.exit(1)
@@ -34,10 +68,9 @@ dfs = dfs[(dfs.Plate==int(plate)) & (dfs.Well.str.startswith(row))].copy()
 dfs = pd.merge(df[['Plate', 'Well', 'Site']], dfs)
 dfs['Label'] = dfs['Label'].astype(int)
 
-df['Channel'] = df.Marker.map(marker_to_channel)
-
 wws = 400
 th, tw = coloc.imread(df.iloc[0].Path).shape
+# We know max site will always be <= 12 for this dataset.
 wh = 3 if df.Site.max() <= 9 else 4
 ww = 3
 ih = wh * th
@@ -47,6 +80,8 @@ zmask = np.zeros( shape=(ih, iw), dtype='uint32')
 
 num_workers = min(len(os.sched_getaffinity(0)), 8)
 
+# V5 images are duplicated across multiple rows in df. We'll use this set to
+# track which ones we've loaded to avoid redundant work.
 loaded_v5 = set()
 def load(t):
     col = int(t.Well[1:]) - 1
@@ -61,10 +96,13 @@ def load(t):
         ch_v5 = marker_to_channel['V5']
         field = coloc.imread(t.PathV5)
         zimg[ch_v5, y:y+th, x:x+tw] = field
-        zimg[ch_v5 + 4, y:y+th, x:x+tw] = coloc.prepare_v5(field, t.V5ControlLevel)
+        if hasattr(t, 'V5ControlLevel'):
+            zimg[ch_v5 + 4, y:y+th, x:x+tw] = coloc.prepare_v5(field, t.V5ControlLevel)
         dfs.loc[(dfs.Site == t.Site) & (dfs.Well == t.Well), ['X', 'Y']] += [x, y]
         loaded_v5.add(t.PathV5)
-    zmask[y:y+th, x:x+tw] = tifffile.imread(f'out/masks/{t.Plate}/{t.Well}_{t.Site}.tif')
+    mask_path = base / 'out' / 'masks' / str(t.Plate) / f'{t.Well}_{t.Site}.tif'
+    if mask_path.exists():
+        zmask[y:y+th, x:x+tw] = tifffile.imread(mask_path)
 
 with concurrent.futures.ThreadPoolExecutor(num_workers) as pool:
     list(tqdm.tqdm(pool.map(load, df.itertuples()), total=len(df), desc='loading images'))
@@ -137,7 +175,7 @@ for c, n, p in zip(colors * 2, channels_raw + channels, pyramids):
         colormap=c,
         name=n,
         blending='additive',
-        visible='raw' not in n,
+        visible=(n in ('Hoechst (raw)', 'V5 (raw)')) if v5control else ('raw' not in n),
     )
     layer._update_thumbnail = update_thumbnail.__get__(layer)
     layer._update_thumbnail()
@@ -146,7 +184,6 @@ labels_layer = viewer.add_labels(
     name='Segmentation',
     visible=False,
 )
-labels_layer.contour = 1
 viewer.add_shapes(
     bbox_rects,
     face_color='transparent',
