@@ -341,8 +341,8 @@ def generate_figure(plate_row_line, marker):
         .iloc[0]
         .Path
     )
-    img_v5 = coloc.imread(r.PathV5)
-    img_marker = coloc.imread(r.Path)
+    img_v5 = coloc.subtract_bg(coloc.imread(r.PathV5))
+    img_marker = coloc.subtract_bg(coloc.imread(r.Path))
     img_dna = coloc.imread(path_dna)
     x1 = np.clip(cx - CROP_WIDTH // 2, 0, img_v5.shape[1] - CROP_WIDTH)
     y1 = np.clip(cy - CROP_WIDTH // 2, 0, img_v5.shape[0] - CROP_WIDTH)

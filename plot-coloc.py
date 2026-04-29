@@ -62,95 +62,99 @@ dfms = pd.merge(dfms, cell_line_locations)
 
 dfmsp = dfms[dfms.QcPass & dfms.V5Positive]
 
+plot_qc = False
+
 # g = sns.FacetGrid(dfc.assign(plate=dfc.plate.astype('category'), color=(dfc.quality<5), x=(dfc.column+(dfc.site-1)%3/4), y=2-(dfc.site-1)//3), col='plate', col_wrap=5)
 # g.map_dataframe(sns.scatterplot, x='x', y='y', hue='color')
 # for ax in g.axes.ravel():
 #     ax.set_aspect(0.25)
 
-sns.jointplot(
-    dfc,
-    x='NumCells',
-    y='ParentalV5',
-    hue='QcPass',
-    kind='scatter',
-    alpha=0.3,
-    marginal_kws=dict(cut=0),
-)
+if plot_qc:
 
-sns.catplot(
-    dfc.assign(Column=dfc.Column.astype('category')),
-    col='Plate',
-    col_wrap=min(dfc.Plate.nunique(), 5),
-    x='Column',
-    hue='Column',
-    y='ParentalV5',
-    log_scale=True,
-    kind='swarm',
-    size=3,
-)
+    sns.jointplot(
+        dfc,
+        x='NumCells',
+        y='ParentalV5',
+        hue='QcPass',
+        kind='scatter',
+        alpha=0.3,
+        marginal_kws=dict(cut=0),
+    )
 
-well_v5positive = (
-    dfms[(dfms.Marker=='DNA') & dfms.V5Positive]
-    .groupby(['Plate', 'Well'])
-    .size()
-    .map(np.log)
-    .rename('V5PositiveCount')
-    .reset_index()
-)
-well_v5positive['Row'] = well_v5positive['Well'].str[0].map(ord) - ord('A') + 1
-well_v5positive['Column'] = well_v5positive['Well'].str[1:].astype(int)
+    sns.catplot(
+        dfc.assign(Column=dfc.Column.astype('category')),
+        col='Plate',
+        col_wrap=min(dfc.Plate.nunique(), 5),
+        x='Column',
+        hue='Column',
+        y='ParentalV5',
+        log_scale=True,
+        kind='swarm',
+        size=3,
+    )
 
-sm = plt.cm.ScalarMappable(
-    cmap='summer',
-    norm = plt.Normalize(
-        well_v5positive.V5PositiveCount.min(),
-        well_v5positive.V5PositiveCount.max(),
-    ),
-)
-g = sns.FacetGrid(
-    well_v5positive,
-    col='Plate',
-    col_wrap=min(dfc.Plate.nunique(), 5),
-    height=1.55,
-)
-g.map_dataframe(
-    sns.scatterplot,
-    x='Column',
-    y='Row',
-    hue='V5PositiveCount',
-    s=100,
-    marker='s',
-    ec='none',
-    palette=sm.cmap,
-    hue_norm=sm.norm,
-)
-g.axes[0].set_xticks([2, 4, 6, 8, 10])
-g.axes[0].set_yticks([2, 4, 6, 8])
-g.axes[0].set_xlim(1.5, 11.5)
-g.axes[0].set_ylim(8.5, 1.5)
-g.add_legend()
-g._legend.remove()
-cbar_ax = g.figure.add_axes([.92, 0.13, 0.015, 0.8])
-g.figure.colorbar(sm, cbar_ax, label='log( mean V5PositiveCount )')
+    well_v5positive = (
+        dfms[(dfms.Marker=='DNA') & dfms.V5Positive]
+        .groupby(['Plate', 'Well'])
+        .size()
+        .map(np.log)
+        .rename('V5PositiveCount')
+        .reset_index()
+    )
+    well_v5positive['Row'] = well_v5positive['Well'].str[0].map(ord) - ord('A') + 1
+    well_v5positive['Column'] = well_v5positive['Well'].str[1:].astype(int)
 
-g = sns.catplot(
-    dfmsp,
-    col='PlateRowLine',
-    col_wrap=20,
-    x='M1',
-    hue='Marker',
-    y='Marker',
-    order=marker_order,
-    kind='violin',
-    inner=None,
-    linewidth=0,
-    cut=0,
-    aspect=1,
-)
-g.set_titles('{col_name}')
-for ax in g.axes:
-    ax.spines[:].set_visible(False)
-    ax.tick_params('y', length=0)
+    sm = plt.cm.ScalarMappable(
+        cmap='summer',
+        norm = plt.Normalize(
+            well_v5positive.V5PositiveCount.min(),
+            well_v5positive.V5PositiveCount.max(),
+        ),
+    )
+    g = sns.FacetGrid(
+        well_v5positive,
+        col='Plate',
+        col_wrap=min(dfc.Plate.nunique(), 5),
+        height=1.55,
+    )
+    g.map_dataframe(
+        sns.scatterplot,
+        x='Column',
+        y='Row',
+        hue='V5PositiveCount',
+        s=100,
+        marker='s',
+        ec='none',
+        palette=sm.cmap,
+        hue_norm=sm.norm,
+    )
+    g.axes[0].set_xticks([2, 4, 6, 8, 10])
+    g.axes[0].set_yticks([2, 4, 6, 8])
+    g.axes[0].set_xlim(1.5, 11.5)
+    g.axes[0].set_ylim(8.5, 1.5)
+    g.add_legend()
+    g._legend.remove()
+    cbar_ax = g.figure.add_axes([.92, 0.13, 0.015, 0.8])
+    g.figure.colorbar(sm, cbar_ax, label='log( mean V5PositiveCount )')
+
+    g = sns.catplot(
+        dfmsp,
+        col='PlateRowLine',
+        col_wrap=20,
+        x='M1',
+        hue='Marker',
+        y='Marker',
+        order=marker_order,
+        kind='violin',
+        inner=None,
+        linewidth=0,
+        cut=0,
+        aspect=1,
+    )
+    g.set_titles('{col_name}')
+    for ax in g.axes:
+        ax.spines[:].set_visible(False)
+        ax.tick_params('y', length=0)
 
 dfmm = (
     dfmsp
@@ -187,14 +191,16 @@ cell_count = (
 
 # TEMP: random_state chosen to make the cluster containing the membrane-expressing lines end up with
 # label 0 so it's colored green in the Pastel2 cmap.
-m1m_cluster = sklearn.cluster.KMeans(n_clusters=6, n_init=10, random_state=0)
+m1m_cluster = sklearn.cluster.KMeans(n_clusters=5, n_init=10, random_state=0)
 m1m_cluster.fit(m1m, sample_weight=cell_count)
 m1m_labels = m1m_cluster.labels_
 m1mpca = sklearn.decomposition.PCA().fit(m1m)
 m1m_X_reduced = m1mpca.transform(m1m)
 
-sns.pairplot(m1m)
+if plot_qc:
+    sns.pairplot(m1m)
 
+# PCA explained variance
 plt.figure()
 sns.pointplot(
     pd.DataFrame({
@@ -206,6 +212,7 @@ sns.pointplot(
     markers='none',
 )
 
+# PCA loadings
 g = sns.catplot(
     pd.DataFrame(
         m1mpca.components_.T,
@@ -230,6 +237,7 @@ plt.tight_layout()
 for ax in g.axes.flat:
     ax.axhline(0, c='lightgray', lw=1)
 
+# PCA first 2 dimensions, colored by K-means cluster
 plt.figure()
 ax = sns.scatterplot(
     pd.DataFrame({
@@ -244,6 +252,7 @@ ax = sns.scatterplot(
 )
 ax.set_title("PCA first 2 dimensions")
 
+# Parallel coordinate plot of M1 for each K-means cluster
 g = sns.catplot(
     m1m
     .assign(Cluster=m1m_labels)
@@ -302,28 +311,34 @@ clustermap_row_colors = pd.concat(
 # Explicitly calculate distance matrix so we can explicitly impose a high distance between members
 # of different k-means clusters.
 dist = scipy.spatial.distance.squareform(scipy.spatial.distance.pdist(m1m))
-max_intra_dist = 0.0
-for i1, m1 in enumerate(m1m.index):
-    for i2, m2 in enumerate(m1m.index):
-        c1 = m1m_labels[i1]
-        c2 = m1m_labels[i2]
-        if c1 != c2:
-            # Different cluster, flag with nan for later backfilling.
-            dist[i1, i2] = np.nan
-        else:
-            # Same cluster, keep track of highest seen distance.
-            max_intra_dist = max(max_intra_dist, dist[i1, i2])
-# Fill all inter-cluster entries with the maximum intra-cluster distance. This should be enough to
-# force each k-means cluster into its own hierarchical cluster branch (with some variance across
-# different linkage methods).
-dist[np.isnan(dist)] = max_intra_dist
-row_linkage = scipy.cluster.hierarchy.linkage(
-    scipy.spatial.distance.squareform(dist), method='average'
+# max_intra_dist = 0.0
+# for i1, m1 in enumerate(m1m.index):
+#     for i2, m2 in enumerate(m1m.index):
+#         c1 = m1m_labels[i1]
+#         c2 = m1m_labels[i2]
+#         if c1 != c2:
+#             # Different cluster, flag with nan for later backfilling.
+#             dist[i1, i2] = np.nan
+#         else:
+#             # Same cluster, keep track of highest seen distance.
+#             max_intra_dist = max(max_intra_dist, dist[i1, i2])
+# # Fill all inter-cluster entries with the maximum intra-cluster distance. This should be enough to
+# # force each k-means cluster into its own hierarchical cluster branch (with some variance across
+# # different linkage methods).
+# dist[np.isnan(dist)] = max_intra_dist
+# row_linkage = scipy.cluster.hierarchy.linkage(
+#     scipy.spatial.distance.squareform(dist), method='average'
+# )
+row_linkage = scipy.cluster.hierarchy.weighted(
+    scipy.spatial.distance.squareform(dist),
 )
 
+# Clustermap of M1 values
 g = sns.clustermap(
     m1m,
     center=0,
+    vmin=-2,
+    vmax=2,
     xticklabels=True,
     yticklabels=True,
     linewidth=0,
@@ -345,6 +360,8 @@ plt.legend(
 )
 plt.colorbar(cell_count_cmap, ax=g.ax_col_dendrogram, shrink=0.9, label='CellCount', location='left')
 
+# Stack cell line thumbnail images (generated by a separate script) into a single tall image, with
+# the same ordering as the heatmap clustergram.
 '''
 import imageio.v3
 from PIL import Image, ImageDraw, ImageFont

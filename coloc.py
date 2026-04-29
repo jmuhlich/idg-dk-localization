@@ -124,7 +124,7 @@ def parse_paths(directory, well):
 # def subtract_bg(img, block_size):
 #     return np.clip(img - skimage.filters.threshold_local(img, block_size), 0, np.inf).astype(np.uint16)
 
-def subtract_bg(img):
+def subtract_bg_median(img):
     # OpenCV's medianBlur is very fast, but only supports apertures > 5px on
     # uint8 images. We will log-transform our image (to preserve the dynamic
     # range) and rescale it to uint8, compute the medianBlur, then reverse the
@@ -137,6 +137,16 @@ def subtract_bg(img):
     blur = np.exp(blur_log8 * factor)
     subtracted = np.clip(img - blur, 0, 65535).astype(np.uint16)
     return subtracted
+
+
+def subtract_bg(img, r=100, strength=1.0):
+    # Local background subtraction of very large features (mostly out-of-focus blobs).
+    img = skimage.util.img_as_float32(img)
+    img_blur = cv2.GaussianBlur(img, (0, 0), r)
+    res = np.clip(img - img_blur * strength, 0, 1)
+    res = (res * 65535).astype(np.uint16)
+    return res
+
 
 def calc_quality(img_dna):
     # quality = 5 seems to be a good cutoff based on visual inspection.
@@ -154,19 +164,19 @@ def prepare_dna(img):
 
 
 def prepare_marker(img):
-    vmin1, _ = auto_threshold(img, 2)
-    img = np.clip(img - float(vmin1), 0, 65535).astype(np.uint16)
     img = subtract_bg(img)
-    vmin2, _ = auto_threshold(img, 2)
-    img = np.clip(img - float(vmin2), 0, 65535).astype(np.uint16)
+    img = subtract_bg_median(img)
+    vmin, _ = auto_threshold(img, 2)
+    img = np.clip(img - float(vmin), 0, 65535).astype(np.uint16)
     mask = skimage.morphology.remove_small_objects(img > 0, 10)
     img[~mask] = 0
     return img
 
 
 def prepare_v5(img, parental_level):
-    img = np.clip(img - float(parental_level), 0, 65535).astype(np.uint16)
     img = subtract_bg(img)
+    img = np.clip(img - float(parental_level), 0, 65535).astype(np.uint16)
+    img = subtract_bg_median(img)
     mask = skimage.morphology.remove_small_objects(img > 0, 10)
     img[~mask] = 0
     return img
@@ -437,6 +447,7 @@ def setup(argv=sys.argv):
     global cp
 
     threadpoolctl.threadpool_limits(1)
+    cv2.setNumThreads(1)
 
     if hasattr(os, "sched_getaffinity"):
         num_workers = len(os.sched_getaffinity(0))
@@ -533,7 +544,7 @@ def main():
     #df_meta = df_meta[(df_meta.plate == 11) & df_meta.row.isin([1, 7]) & df_meta.column.isin([11, 12])]
     #df_meta = df_meta[(df_meta.plate == 11) & df_meta.row.isin([1, 7]) & df_meta.column.isin([11])]
     #df_meta = df_meta[(df_meta.plate == 11) & df_meta.row.isin([1, 7])]
-    #df_meta = df_meta[(df_meta.plate == 15)]
+    #df_meta = df_meta.query('plate.isin([7,11]) & row!=2')
     #df_meta = df_meta.query("plate==23 & column==4 & row<=2")
     #print(df_meta.groupby(['plate', 'row']).size())
 
