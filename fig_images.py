@@ -10,7 +10,6 @@ import skimage.exposure
 import sklearn.cluster
 import sklearn.mixture
 import sys
-import threading
 import threadpoolctl
 import tqdm
 
@@ -164,15 +163,13 @@ def auto_threshold_marker(img_wrap, name):
     return vmin, vmax
 
 
-def gray(img, marker):
+def gray(img, normalize=True):
     img = skimage.util.img_as_float32(img)
-    img = skimage.exposure.rescale_intensity(img)
+    if normalize:
+        img = skimage.exposure.rescale_intensity(img)
     img = np.dstack([img, img, img])
     return img
 
-# Functions from the colour package are somehow not thread-safe so we serialize
-# all calls. Without locking, the functions generate wrong results.
-# c_lock = threading.Lock()
 def colorize(v5=None, marker=None, dna=None, marker_name=None):
     assert (marker is not None and marker_name is not None) or (marker is None and marker_name is None)
     shape = v5.shape if v5 is not None else marker.shape if marker is not None else dna.shape
@@ -188,13 +185,10 @@ def colorize(v5=None, marker=None, dna=None, marker_name=None):
         rrange = (0, 65535)
         lum_img = skimage.exposure.rescale_intensity(rimg, rrange, float)
         cimg = np.zeros_like(img_xyz)
-        #with c_lock:
         cimg[..., 0] = colour.lightness(lum_img) * L
         cimg[..., 1] = C
         cimg[..., 2] = h
-        #with c_lock:
         img_xyz += colour.Oklab_to_XYZ(colour.Oklch_to_Oklab(cimg))
-    #with c_lock:
     img = np.clip(colour.XYZ_to_sRGB(img_xyz), 0, 1)
     return img
 
@@ -203,7 +197,9 @@ threadpoolctl.threadpool_limits(1)
 dfm = pd.read_csv(sys.argv[1])
 dfms = pd.read_parquet(sys.argv[2])
 
-base = pathlib.Path(__file__).parent.resolve() / "out" / "figures"
+project_path = pathlib.Path(__file__).parent.resolve()
+
+base = project_path / "out" / "figures"
 print(f"Saving images to: {base}")
 base.mkdir(parents=True, exist_ok=True)
 
@@ -268,8 +264,6 @@ hpad = np.zeros((CROP_WIDTH, PADDING, 3))
 gbs = dfms.groupby(['PlateRowLine', 'Marker'])
 gbsp = dfmsp.groupby(['PlateRowLine', 'Marker'])
 
-#cluster_lock = threading.Lock()
-
 def save_figure(plate_row_line, marker):
     img = generate_figure(plate_row_line, marker)
     if img is not None:
@@ -278,8 +272,6 @@ def save_figure(plate_row_line, marker):
 def generate_figure(plate_row_line, marker):
     if marker == 'DNA':
         marker_show = 'lamin'
-    elif marker == 'Membrane':
-        marker_show = 'streptavidin'
     else:
         marker_show = marker
     try:
@@ -300,22 +292,6 @@ def generate_figure(plate_row_line, marker):
         .get_group((well, site))
         .copy()
     )
-    # dbscan can cause deadlocks if run from multiple threads in parallel.
-    #with cluster_lock:
-    # _, labels = sklearn.cluster.dbscan(cells[['X','Y']], metric='euclidean', eps=80, min_samples=10, n_jobs=1)
-    # if (labels == -1).all():
-    #     _, labels = sklearn.cluster.dbscan(cells[['X','Y']], metric='euclidean', eps=100, min_samples=5, n_jobs=1)
-    #     if (labels == -1).all():
-    #         # If no real clusters exist, use single cell with highest M1 as the "cluster".
-    #         idx = np.argsort(cells['M1']).iloc[-1]
-    #         labels[idx] = 0
-    # cells['Cluster'] = labels
-    # cluster_sizes = cells.Cluster.value_counts().drop(-1, errors='ignore')
-    # best_cluster = np.abs(cluster_sizes - CLUSTER_SIZE_TARGET).sort_values().index[0]
-    #cell_pos = cells[cells.Cluster==best_cluster][['X', 'Y']]
-    #cell_idx = np.linalg.norm(cell_pos - cell_pos.mean(), axis=1).argmin()
-    #cx, cy = cell_pos.iloc[cell_idx].round().astype(int)
-    #cx, cy = cells[cells.Cluster==best_cluster].sort_values('M1').iloc[-1][['X','Y']].astype(int)
     tree = scipy.spatial.KDTree(cells[['X','Y']])
     neighbors = tree.query_ball_tree(tree, r=CROP_WIDTH/2, p=1)
     cells_pass = cells['QcPass'] & cells['V5Positive']
@@ -342,7 +318,10 @@ def generate_figure(plate_row_line, marker):
         .Path
     )
     img_v5 = coloc.subtract_bg(coloc.imread(r.PathV5))
-    img_marker = coloc.subtract_bg(coloc.imread(r.Path))
+    if marker == 'Membrane':
+        img_marker = coloc.calc_membrane_mask(coloc.load_mask(r.Plate, well, site)) * 0.5
+    else:
+        img_marker = coloc.subtract_bg(coloc.imread(r.Path))
     img_dna = coloc.imread(path_dna)
     x1 = np.clip(cx - CROP_WIDTH // 2, 0, img_v5.shape[1] - CROP_WIDTH)
     y1 = np.clip(cy - CROP_WIDTH // 2, 0, img_v5.shape[0] - CROP_WIDTH)
@@ -351,9 +330,9 @@ def generate_figure(plate_row_line, marker):
     crop_v5 = img_v5[y1:y2, x1:x2]
     crop_marker = img_marker[y1:y2, x1:x2]
     crop_dna = img_dna[y1:y2, x1:x2]
-    panel_v5 = gray(crop_v5, marker='v5')
-    panel_marker = gray(crop_marker, marker=marker_show)
-    panel_dna = gray(crop_dna, marker='dna')
+    panel_v5 = gray(crop_v5)
+    panel_marker = gray(crop_marker, normalize=(marker != 'Membrane'))
+    panel_dna = gray(crop_dna)
     # Quick and dirty RGB merge.
     panel_merge = np.dstack([panel_marker[..., 0], panel_v5[...,0], panel_dna[...,0]])
     img_out = np.hstack([panel_v5, hpad, panel_marker, hpad, panel_dna, hpad, panel_merge])

@@ -220,8 +220,8 @@ def save_mask(plate, well, site, img):
     )
 
 
-def load_mask(plate, well, site):
-    return tifffile.imread(f'out/masks/{plate}/{well}_{site}.tif')
+def load_mask(plate, well, site, base_path=pathlib.Path('out/masks')):
+    return tifffile.imread(base_path / str(plate) / f'{well}_{site}.tif')
 
 
 def phase_cross_correlation(a, b):
