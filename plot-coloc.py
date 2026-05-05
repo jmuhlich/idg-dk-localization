@@ -377,5 +377,5 @@ gallery_img = np.vstack([
     ])
     for prl, m in best_m1_marker.loc[m1m.index[g.dendrogram_row.reordered_ind]].items()
 ])
-imageio.v3.imwrite('out/heatmap_gallery.png', gallery_img)
+imageio.v3.imwrite('out/heatmap_gallery.jpg', gallery_img)
 '''
