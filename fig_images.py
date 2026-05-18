@@ -4,6 +4,7 @@ import imageio.v3 as imageio
 import numpy as np
 import pandas as pd
 import pathlib
+from PIL import Image, ImageDraw, ImageFont
 import scipy.stats
 import scipy.spatial
 import skimage.exposure
@@ -198,6 +199,7 @@ threadpoolctl.threadpool_limits(1)
 
 dfm = pd.read_csv(sys.argv[1])
 dfms = pd.read_parquet(sys.argv[2])
+dfcg = pd.read_csv(sys.argv[3])
 
 project_path = pathlib.Path(__file__).parent.resolve()
 
@@ -266,10 +268,6 @@ hpad = np.zeros((CROP_WIDTH, PADDING, 3))
 gbs = dfms.groupby(['PlateRowLine', 'Marker'])
 gbsp = dfmsp.groupby(['PlateRowLine', 'Marker'])
 
-def save_figure(plate_row_line, marker):
-    img = generate_figure(plate_row_line, marker)
-    if img is not None:
-        imageio.imwrite(base / f"{plate_row_line} {marker}.jpg", img, quality=95)
 
 def generate_figure(plate_row_line, marker):
     if marker == 'DNA':
@@ -339,8 +337,46 @@ def generate_figure(plate_row_line, marker):
     panel_merge = np.dstack([panel_marker[..., 0], panel_v5[...,0], panel_dna[...,0]])
     img_out = np.hstack([panel_v5, hpad, panel_marker, hpad, panel_dna, hpad, panel_merge])
     img_out = skimage.util.img_as_ubyte(img_out)
-    return img_out
+    meta = {
+        'PlateRowLine': plate_row_line,
+        'Well': well,
+        'Site': site,
+        'Cx': cx,
+        'Cy': cy,
+        'X1': x1,
+        'Y1': y1,
+        'X2': x2,
+        'Y2': y2,
+    }
+    return img_out, meta
 
 
+metas = []
 for (plate_row_line, marker) in tqdm.tqdm(best_m1_marker.items(), total=len(best_m1_marker)):
-    save_figure(plate_row_line, marker)
+    img, meta = generate_figure(plate_row_line, marker)
+    if img is not None:
+        imageio.imwrite(base / f"{plate_row_line} {marker}.jpg", img, quality=95)
+        metas.append(meta)
+pd.DataFrame(metas).to_csv(base / 'figure_metadata.csv', index=False)
+
+
+# Stack cell line thumbnail images into a single tall image, with the same ordering as the heatmap
+# clustergram.
+
+fnt = ImageFont.truetype("Pillow/Tests/fonts/FreeMono.ttf", 30)
+
+def draw_label(s):
+    img = Image.new("RGB", (175,175), (0, 0, 0))
+    ImageDraw.Draw(img).text((10, 175/2), s, anchor='lm', font=fnt, fill=(255,255,255))
+    return np.array(img)
+
+dfcg['Path'] = [list(base.glob(prl + '*'))[0] for prl in dfcg['cell_id']]
+dfcg['Marker'] = [p.stem.rsplit(' ', 1)[1] for p in dfcg['Path']]
+gallery_img = np.vstack([
+    np.hstack([
+        draw_label(f"{r.cell_id}\n{r.Marker}\n{r.coloc_cluster_labels}"),
+        imageio.imread(r.Path),
+    ])
+    for r in dfcg.itertuples()
+])
+imageio.imwrite(base / 'heatmap_gallery.jpg', gallery_img)
