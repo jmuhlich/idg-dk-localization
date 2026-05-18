@@ -166,7 +166,9 @@ def auto_threshold_marker(img_wrap, name):
 def gray(img, normalize=True):
     img = skimage.util.img_as_float32(img)
     if normalize:
-        img = skimage.exposure.rescale_intensity(img)
+        vmin, vmax = np.percentile(img, [0.1, 99.9])
+        img = skimage.exposure.rescale_intensity(img, in_range=(vmin, vmax))
+        img = np.clip(img, 0, 1)
     img = np.dstack([img, img, img])
     return img
 
