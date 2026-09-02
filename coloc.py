@@ -30,7 +30,7 @@ class SerialExecutor:
         return None
 
 
-def imread(path):
+def imread(path, crop=True):
     tiff = tifffile.TiffFile(path)
     img = tiff.series[0].asarray()
     channel = tiff.metaseries_metadata["PlaneInfo"]["_IllumSetting_"]
@@ -53,8 +53,9 @@ def imread(path):
     else:
         raise ValueError(f"Unexpected channel name: {channel}")
     img = img.astype(np.uint16, copy=False)
-    # Crop the top and right to avoid illumination artifacts.
-    img = img[400:, :-400]
+    if crop:
+        # Crop the top and right to avoid illumination artifacts.
+        img = img[400:, :-400]
     return img
 
 
@@ -202,13 +203,15 @@ def calc_v5_mask(img_dna_raw, img_v5_raw, parental_v5, labels=None):
     return mask, labels
 
 
-def calc_membrane_mask(labels):
+def calc_membrane_mask(labels, crop=True):
     mask = labels > 0
     props = skimage.measure.regionprops(labels)
     fp = skimage.morphology.disk(1)
     for p in props:
         cmask = skimage.morphology.erosion(p.image_filled, fp)
         mask[p.slice][cmask] = 0
+    if not crop:
+        mask = np.pad(mask, ((400, 0), (0, 400)))
     return mask
 
 
