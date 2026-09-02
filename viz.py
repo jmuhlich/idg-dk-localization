@@ -69,7 +69,7 @@ dfs = pd.merge(df[['Plate', 'Well', 'Site']], dfs)
 dfs['Label'] = dfs['Label'].astype(int)
 
 wws = 400
-th, tw = coloc.imread(df.iloc[0].Path).shape
+th, tw = coloc.imread(df.iloc[-1].Path).shape
 # We know max site will always be <= 12 for this dataset.
 wh = 3 if df.Site.max() <= 9 else 4
 ww = 3
@@ -88,7 +88,11 @@ def load(t):
     field = t.Site - 1
     x = (col * ww + field % ww) * tw + col * wws
     y = field // ww * th
-    field = coloc.imread(t.Path)
+    try:
+        field = coloc.imread(t.Path)
+    except FileNotFoundError:
+        print(f"Missing file: {t.Path}")
+        return
     prep = coloc.prepare_dna if t.Marker == 'Hoechst33342' else coloc.prepare_marker
     zimg[t.Channel, y:y+th, x:x+tw] = field
     zimg[t.Channel + 4, y:y+th, x:x+tw] = prep(field)
@@ -160,7 +164,7 @@ text_parameters3 = {
     'translation': [-ew, 0],
 }
 
-colors = ("gray", "red", "green", "bop blue")
+colors = ("gray", "green", "red", "bop blue", "gray", "yellow", "red", "bop blue")
 channels = ('Hoechst', 'V5', 'TRITC', 'Cy5')
 channels_raw = tuple(f'{c} (raw)' for c in channels)
 
@@ -168,14 +172,14 @@ def update_thumbnail(layer):
     layer.thumbnail = np.ones(layer._thumbnail_shape) * layer.colormap.map(0.7)
 
 viewer = napari.Viewer()
-for c, n, p in zip(colors * 2, channels_raw + channels, pyramids):
+for c, n, p in zip(colors, channels_raw + channels, pyramids):
     layer = viewer.add_image(
         p,
         contrast_limits=(0, 65535),
         colormap=c,
         name=n,
         blending='additive',
-        visible=(n in ('Hoechst (raw)', 'V5 (raw)')) if v5control else ('raw' not in n),
+        visible=n in ('Hoechst (raw)', 'V5 (raw)'),
     )
     layer._update_thumbnail = update_thumbnail.__get__(layer)
     layer._update_thumbnail()
