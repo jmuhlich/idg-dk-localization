@@ -27,6 +27,7 @@ threadpoolctl.threadpool_limits(1)
 
 dfm = pd.read_csv(sys.argv[1])
 dfms = pd.read_parquet(sys.argv[2])
+dfcg = pd.read_csv(sys.argv[3])
 
 project_path = pathlib.Path(__file__).parent.resolve()
 
@@ -106,6 +107,9 @@ def generate_figure(plate_row_line, marker):
         .iloc[0]
         .Path
     )
+    if not pathlib.Path(r.PathV5).exists():
+        print(f"Missing images for {plate_row_line} / {marker_show}")
+        return None, None
     img_v5 = coloc.subtract_bg(coloc.imread(r.PathV5))
     if marker.lower() == 'membrane':
         img_marker = coloc.calc_membrane_mask(coloc.load_mask(r.Plate, well, site)) * 0.5
@@ -138,7 +142,7 @@ def generate_figure(plate_row_line, marker):
 
 
 metas = []
-for plate_row_line in tqdm.tqdm(cell_line_locations['PlateRowLine'].drop_duplicates()):
+for plate_row_line in tqdm.tqdm(dfcg['cell_id']):
     img, meta = generate_figure(plate_row_line, 'streptavidin')
     if img is not None:
         imageio.imwrite(base / f"{plate_row_line} streptavidin.jpg", img, quality=95)
@@ -149,20 +153,25 @@ for plate_row_line in tqdm.tqdm(cell_line_locations['PlateRowLine'].drop_duplica
 # Stack cell line thumbnail images into a single tall image, with the same ordering as the heatmap
 # clustergram.
 
-# fnt = ImageFont.truetype("Pillow/Tests/fonts/FreeMono.ttf", 30)
+fnt = ImageFont.truetype("Pillow/Tests/fonts/FreeMono.ttf", 30)
 
-# def draw_label(s):
-#     img = Image.new("RGB", (175,175), (0, 0, 0))
-#     ImageDraw.Draw(img).text((10, 175/2), s, anchor='lm', font=fnt, fill=(255,255,255))
-#     return np.array(img)
+def draw_label(s):
+    img = Image.new("RGB", (175,175), (0, 0, 0))
+    ImageDraw.Draw(img).text((10, 175/2), s, anchor='lm', font=fnt, fill=(255,255,255))
+    return np.array(img)
 
-# dfcg['Path'] = [list(base.glob(prl + '*'))[0] for prl in dfcg['cell_id']]
-# dfcg['Marker'] = [p.stem.split(' ', 2)[2] for p in dfcg['Path']]
-# gallery_img = np.vstack([
-#     np.hstack([
-#         draw_label(f"{r.cell_id}\n{r.Marker}\n{r.coloc_cluster_labels}"),
-#         imageio.imread(r.Path),
-#     ])
-#     for r in dfcg.itertuples()
-# ])
-# imageio.imwrite(base / 'heatmap_gallery.jpg', gallery_img)
+def imread_or_empty(p):
+    if p.exists():
+        return imageio.imread(p)
+    else:
+        return np.zeros((175, 730, 3), np.uint8)
+
+dfcg['Path'] = [base / f'{prl} streptavidin.jpg' for prl in dfcg['cell_id']]
+gallery_img = np.vstack([
+    np.hstack([
+        draw_label(f"{r.cell_id}\nstreptavidin\n"),
+        imread_or_empty(r.Path),
+    ])
+    for r in dfcg.itertuples()
+])
+imageio.imwrite(base / 'heatmap_gallery.jpg', gallery_img)
